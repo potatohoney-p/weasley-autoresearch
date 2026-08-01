@@ -21,15 +21,14 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { truncateTail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum, Type } from "@earendil-works/pi-ai";
 import { Text, truncateToWidth, matchesKey, visibleWidth } from "@earendil-works/pi-tui";
-import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type Server, type ServerResponse } from "node:http";
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -468,13 +467,41 @@ interface AutoresearchConfig {
 
 /** Read the config file (.auto/config.json, legacy autoresearch.config.json) from the given directory (always ctx.cwd) */
 function readConfig(cwd: string): AutoresearchConfig {
+  const configPath = autoresearchConfigPath(cwd);
+  if (!fs.existsSync(configPath)) return {};
+
+  let parsed: unknown;
   try {
-    const configPath = autoresearchConfigPath(cwd);
-    if (!fs.existsSync(configPath)) return {};
-    return JSON.parse(fs.readFileSync(configPath, "utf-8"));
-  } catch {
-    return {};
+    parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  } catch (error) {
+    throw new Error(
+      `Invalid ${path.relative(cwd, configPath) || path.basename(configPath)}: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Invalid .auto/config.json: expected a JSON object.");
+  }
+
+  const config = parsed as Record<string, unknown>;
+  const unknown = Object.keys(config).filter(
+    (key) => key !== "maxIterations" && key !== "workingDir"
+  );
+  if (unknown.length > 0) {
+    throw new Error(`Invalid .auto/config.json: unknown field(s): ${unknown.join(", ")}.`);
+  }
+  if (
+    config.maxIterations !== undefined &&
+    (!Number.isInteger(config.maxIterations) || (config.maxIterations as number) <= 0)
+  ) {
+    throw new Error("Invalid .auto/config.json: maxIterations must be a positive integer.");
+  }
+  if (
+    config.workingDir !== undefined &&
+    (typeof config.workingDir !== "string" || config.workingDir.trim() === "")
+  ) {
+    throw new Error("Invalid .auto/config.json: workingDir must be a non-empty string.");
+  }
+  return config as AutoresearchConfig;
 }
 
 /** Read maxExperiments from the config file (if it exists) */
@@ -563,7 +590,12 @@ function recordedActivationDecision(ctx: ExtensionContext, workDir: string): boo
  * Returns an error message if it doesn't exist, or null if OK.
  */
 function validateWorkDir(ctxCwd: string): string | null {
-  const workDir = resolveWorkDir(ctxCwd);
+  let workDir: string;
+  try {
+    workDir = resolveWorkDir(ctxCwd);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
   if (workDir === ctxCwd) return null;
   try {
     const stat = fs.statSync(workDir);
@@ -572,6 +604,42 @@ function validateWorkDir(ctxCwd: string): string | null {
     }
   } catch {
     return `workingDir "${workDir}" (from .auto/config.json) does not exist.`;
+  }
+  return null;
+}
+
+/**
+ * Return a fail-closed activation error without modifying the repository.
+ * Session artifacts are excluded; every other staged, tracked, or untracked
+ * change belongs to the user and must never be swept into git add/clean later.
+ */
+export function worktreeActivationError(workDir: string): string | null {
+  const status = spawnSync(
+    "git",
+    [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+      "--",
+      ".",
+      ":(exclude,glob)**/.auto/**",
+      ":(exclude,glob)**/autoresearch.*",
+      ":(exclude,glob)**/autoresearch.*/**",
+    ],
+    { cwd: workDir, encoding: "utf8", timeout: 5000 }
+  );
+  if (status.error) {
+    return `Cannot verify a clean git worktree: ${status.error.message}`;
+  }
+  if (status.status !== 0) {
+    const detail = (status.stderr || status.stdout || "git status failed").trim();
+    return `Cannot verify a clean git worktree: ${detail}`;
+  }
+  if (status.stdout.trim()) {
+    return (
+      "Autoresearch requires a clean git worktree before activation. " +
+      "Commit or stash your existing changes, then try again."
+    );
   }
   return null;
 }
@@ -1313,7 +1381,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     let state = runtime.state;
 
-    // Resolve effective working directory (config stays in ctx.cwd, files in workDir)
+    // Resolve effective working directory only after strict config validation.
+    const workDirError = validateWorkDir(ctx.cwd);
+    if (workDirError) {
+      setAutoresearchMode(ctx, false);
+      if (ctx.hasUI) ctx.ui.notify(`Autoresearch disabled: ${workDirError}`, "error");
+      updateWidget(ctx);
+      return;
+    }
     const workDir = resolveWorkDir(ctx.cwd);
 
     // Primary: read from .auto/log.jsonl (alongside .auto/prompt.md and .auto/measure.sh)
@@ -1378,15 +1453,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // A recorded `/autoresearch on|off` in this session wins; otherwise same-cwd
     // sessions default on and redirected workingDir sessions default off, so
     // unrelated chats launched from a shared cwd never activate it.
-    setAutoresearchMode(
-      ctx,
-      shouldAutoActivateAutoresearch(
-        ctx.cwd,
-        workDir,
-        hasPersistedLog,
-        recordedActivationDecision(ctx, workDir),
-      ),
+    const shouldActivate = shouldAutoActivateAutoresearch(
+      ctx.cwd,
+      workDir,
+      hasPersistedLog,
+      recordedActivationDecision(ctx, workDir),
     );
+    const activationError = shouldActivate ? worktreeActivationError(workDir) : null;
+    setAutoresearchMode(ctx, shouldActivate && !activationError);
+    if (activationError && ctx.hasUI) {
+      ctx.ui.notify(`Autoresearch disabled: ${activationError}`, "error");
+    }
 
     updateWidget(ctx);
   };
@@ -2745,9 +2822,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   function logoDataUrl(): string {
     if (cachedLogoDataUrl) return cachedLogoDataUrl;
-    const logoPath = path.join(packageRoot(), "assets/logo.webp");
+    const logoPath = path.join(packageRoot(), "assets/weasley-autoresearch-hero.png");
     const bytes = fs.readFileSync(logoPath);
-    cachedLogoDataUrl = `data:image/webp;base64,${bytes.toString("base64")}`;
+    cachedLogoDataUrl = `data:image/png;base64,${bytes.toString("base64")}`;
     return cachedLogoDataUrl;
   }
 
@@ -2920,6 +2997,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   async function exportDashboard(ctx: ExtensionContext): Promise<void> {
+    const workDirError = validateWorkDir(ctx.cwd);
+    if (workDirError) {
+      ctx.ui.notify(`Export failed: ${workDirError}`, "error");
+      return;
+    }
     const workDir = resolveWorkDir(ctx.cwd);
     const jsonlPath = autoresearchJsonlPath(workDir);
 
@@ -2960,7 +3042,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (command === "off") {
         const wasRunning = !ctx.isIdle();
-        const workDir = resolveWorkDir(ctx.cwd);
+        let workDir = ctx.cwd;
+        try {
+          workDir = resolveWorkDir(ctx.cwd);
+        } catch {
+          // A malformed config must never prevent the emergency OFF path.
+        }
 
         recordAutoresearchActivation(workDir, false);
         setAutoresearchMode(ctx, false);
@@ -2986,7 +3073,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "clear") {
-        const workDir = resolveWorkDir(ctx.cwd);
+        let workDir = ctx.cwd;
+        try {
+          workDir = resolveWorkDir(ctx.cwd);
+        } catch {
+          // Clear remains available to recover from a malformed config.
+        }
         const jsonlPaths = sessionFileCandidates(workDir, "log");
         recordAutoresearchActivation(workDir, false);
         setAutoresearchMode(ctx, false);
@@ -3028,7 +3120,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        ctx.ui.notify(`Autoresearch not activated: ${workDirError}`, "error");
+        return;
+      }
       const workDir = resolveWorkDir(ctx.cwd);
+      const activationError = worktreeActivationError(workDir);
+      if (activationError) {
+        ctx.ui.notify(`Autoresearch not activated: ${activationError}`, "error");
+        return;
+      }
       recordAutoresearchActivation(workDir, true);
       setAutoresearchMode(ctx, true);
       runtime.autoResumeTurns = 0;
