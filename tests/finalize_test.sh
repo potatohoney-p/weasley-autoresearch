@@ -17,6 +17,10 @@ TESTS_FAILED=0
 
 pass() { TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "${GREEN}✓ $1${NC}"; }
 fail_test() { TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "${RED}✗ $1${NC}"; echo "  $2"; }
+configure_git_identity() {
+  git config user.name "Weasley Tests"
+  git config user.email "tests@example.invalid"
+}
 
 # Create a fresh test repo with a simulated autoresearch session
 # Returns the repo path
@@ -25,6 +29,7 @@ setup_repo() {
   REPO=$(mktemp -d)
   cd "$REPO"
   git init --quiet
+  configure_git_identity
   git checkout -b main
 
   # Initial commit on main
@@ -666,6 +671,7 @@ test_nested_session_artifacts() {
   REPO=$(mktemp -d)
   cd "$REPO"
   git init --quiet
+  configure_git_identity
   git checkout -b main
 
   mkdir -p libs/polaris
@@ -740,6 +746,7 @@ test_auto_dir_session_artifacts() {
   REPO=$(mktemp -d)
   cd "$REPO"
   git init --quiet
+  configure_git_identity
   git checkout -b main
 
   mkdir -p libs/polaris
@@ -986,6 +993,7 @@ test_three_groups() {
   REPO=$(mktemp -d)
   cd "$REPO"
   git init --quiet
+  configure_git_identity
   git checkout -b main
 
   echo "original_a" > file_a.txt

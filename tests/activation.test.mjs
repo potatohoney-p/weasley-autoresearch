@@ -1,8 +1,10 @@
 ﻿import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
 
 import autoresearchExtension, {
@@ -11,6 +13,14 @@ import autoresearchExtension, {
 
 const ACTIVATION_ENTRY = "weasley-autoresearch.activation";
 const AUTORESEARCH_TOOLS = ["init_experiment", "log_experiment", "run_experiment"];
+const execFileAsync = promisify(execFile);
+
+async function initGit(cwd) {
+  await execFileAsync("git", ["init", "--quiet"], { cwd });
+  await execFileAsync("git", ["config", "user.email", "tests@example.invalid"], { cwd });
+  await execFileAsync("git", ["config", "user.name", "Weasley Tests"], { cwd });
+  await execFileAsync("git", ["commit", "--allow-empty", "--quiet", "-m", "initial"], { cwd });
+}
 
 function createHarness({ cwd, branch = [], initialActiveTools = [] }) {
   const commands = new Map();
@@ -128,6 +138,7 @@ function staleLogExperimentEntry() {
 }
 
 async function writeRedirectedSession(cwd, workDir, config = {}) {
+  await initGit(workDir);
   await mkdir(join(cwd, ".auto"), { recursive: true });
   await writeFile(
     join(cwd, ".auto", "config.json"),
@@ -158,6 +169,7 @@ async function writeRedirectedSession(cwd, workDir, config = {}) {
 }
 
 async function writeSameCwdLog(cwd) {
+  await initGit(cwd);
   await mkdir(join(cwd, ".auto"), { recursive: true });
   await writeFile(
     join(cwd, ".auto", "log.jsonl"),
@@ -297,6 +309,7 @@ test("starting autoresearch binds redirected workingDir activation to the pi ses
   const workDir = await mkdtemp(join(tmpdir(), "weasley-autoresearch-workdir-"));
 
   try {
+    await initGit(workDir);
     await mkdir(join(cwd, ".auto"), { recursive: true });
     await writeFile(
       join(cwd, ".auto", "config.json"),
@@ -392,6 +405,63 @@ test("deleted logs do not leave a stale autoresearch widget from session history
     assert.deepEqual(harness.activeTools(), []);
     assert.equal(harness.widgets.at(-1)?.name, "autoresearch");
     assert.equal(harness.widgets.at(-1)?.widget, undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("manual activation refuses a dirty user worktree without changing it", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "weasley-autoresearch-dirty-"));
+  try {
+    await initGit(cwd);
+    await writeFile(join(cwd, "user-change.txt"), "keep me\n");
+
+    const harness = createHarness({ cwd });
+    await harness.commands.get("autoresearch").handler("optimize runtime", harness.ctx);
+
+    assert.deepEqual(harness.activeTools(), []);
+    assert.equal(harness.appendedEntries.length, 0);
+    assert.equal(harness.sentMessages.length, 0);
+    assert.match(harness.notifications.at(-1).message, /clean git worktree/i);
+    assert.equal(existsSync(join(cwd, "user-change.txt")), true);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("session files do not make an otherwise clean worktree look dirty", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "weasley-autoresearch-session-files-"));
+  try {
+    await initGit(cwd);
+    await mkdir(join(cwd, ".auto"), { recursive: true });
+    await writeFile(join(cwd, ".auto", "prompt.md"), "# experiment\n");
+
+    const harness = createHarness({ cwd });
+    await harness.commands.get("autoresearch").handler("optimize runtime", harness.ctx);
+
+    assert.deepEqual(harness.activeTools().sort(), AUTORESEARCH_TOOLS.sort());
+    assert.equal(harness.appendedEntries.length, 1);
+    assert.equal(harness.sentMessages.length, 1);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("malformed config fails closed instead of activating with defaults", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "weasley-autoresearch-bad-config-"));
+  try {
+    await initGit(cwd);
+    await mkdir(join(cwd, ".auto"), { recursive: true });
+    await writeFile(join(cwd, ".auto", "config.json"), "{ not json\n");
+
+    const harness = createHarness({ cwd, initialActiveTools: AUTORESEARCH_TOOLS });
+    await harness.handlers.get("session_start")({}, harness.ctx);
+    assert.deepEqual(harness.activeTools(), []);
+    assert.match(harness.notifications.at(-1).message, /invalid .*config\.json/i);
+
+    await harness.commands.get("autoresearch").handler("optimize runtime", harness.ctx);
+    assert.deepEqual(harness.activeTools(), []);
+    assert.equal(harness.appendedEntries.length, 0);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

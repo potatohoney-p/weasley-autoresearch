@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.3] - 2026-08-02
+
+### Added
+
+- Added a fail-closed clean-worktree activation guard so existing staged, tracked, or untracked
+  user changes cannot be swept into later experiment Git operations.
+- Added Apache-2.0 licensing, project notices, community contribution and security guidance, and
+  original Weasley AutoResearch hero artwork.
+
+### Changed
+
+- Configuration parsing now rejects malformed JSON, unknown fields, invalid iteration limits, and
+  invalid working-directory values instead of silently falling back to defaults.
+- Updated the Pi development dependencies, optional peer metadata, minimum Node.js version, locked
+  dependency overrides, and test scripts, including the finalize integration suite.
+- Normalized compaction paths across operating systems and expanded activation/finalization safety
+  coverage.
+
+### Fixed
+
+- Dashboard exports now advertise the replacement hero image with the correct PNG media type.
+
 ## [1.6.2] - 2026-07-09
 
 ### Changed
