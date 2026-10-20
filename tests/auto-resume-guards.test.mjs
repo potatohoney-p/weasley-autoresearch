@@ -88,3 +88,12 @@ test("consecutive failure override resets on keep and ignores previous segments"
   );
 });
 
+test("correctness failures count toward the consecutive failure stop guard", () => {
+  const failures = Array.from({ length: 21 }, (_, i) =>
+    result(["discard", "checks_failed", "crash"][i % 3]));
+  assert.equal(countConsecutiveDiscardOrCrashResults(state(failures)), 21);
+  assert.match(autoResumeStopReasonFor(runtime(0, failures)), /21 consecutive/);
+  assert.equal(countConsecutiveDiscardOrCrashResults(state([...failures, result("keep")])), 0);
+  assert.equal(countConsecutiveDiscardOrCrashResults(state([...failures, result("checks_failed", 1)], 1)), 1);
+});
+

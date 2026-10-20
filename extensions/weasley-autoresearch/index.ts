@@ -119,13 +119,13 @@ type AutoResumeGuardRuntime = {
   state: AutoResumeGuardState;
 };
 
-/** Count trailing discard/crash results in the current segment. */
+/** Count trailing rejected results, including correctness failures, in this segment. */
 export function countConsecutiveDiscardOrCrashResults(state: AutoResumeGuardState): number {
   let count = 0;
   for (let i = state.results.length - 1; i >= 0; i--) {
     const result = state.results[i];
     if (result.segment !== state.currentSegment) break;
-    if (result.status === "discard" || result.status === "crash") {
+    if (result.status === "discard" || result.status === "crash" || result.status === "checks_failed") {
       count++;
       continue;
     }
@@ -140,7 +140,7 @@ export function autoResumeStopReasonFor(runtime: AutoResumeGuardRuntime): string
   }
   const failures = countConsecutiveDiscardOrCrashResults(runtime.state);
   if (failures > CONSECUTIVE_FAILURE_OVERRIDE_LIMIT) {
-    return `Autoresearch auto-resume stopped — ${failures} consecutive discards/crashes`;
+    return `Autoresearch auto-resume stopped — ${failures} consecutive discards/crashes/checks failures`;
   }
   return null;
 }
@@ -178,6 +178,8 @@ interface AutoresearchRuntime {
   autoresearchMode: boolean;
   experimentsThisSession: number;
   autoResumeTurns: number;
+  /** Only the latest completed benchmark in this runtime may authorize a keep. */
+  lastRunBenchmark: { passed: boolean; workDir: string } | null;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
   lastRunDuration: number | null;
   runningExperiment: { startedAt: number; command: string } | null;
@@ -796,6 +798,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     autoresearchMode: false,
     experimentsThisSession: 0,
     autoResumeTurns: 0,
+    lastRunBenchmark: null,
     lastRunChecks: null,
     lastRunDuration: null,
     runningExperiment: null,
@@ -1372,6 +1375,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const reconstructState = (ctx: ExtensionContext) => {
     const runtime = getRuntime(ctx);
     cancelPendingResume(runtime);
+    runtime.lastRunBenchmark = null;
     runtime.lastRunChecks = null;
     runtime.lastRunDuration = null;
     runtime.runningExperiment = null;
@@ -1665,6 +1669,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const isReinit = state.results.length > 0;
+      runtime.lastRunBenchmark = null;
+      runtime.lastRunChecks = null;
+      runtime.lastRunDuration = null;
 
       state.name = params.name;
       state.metricName = params.metric_name;
@@ -1824,6 +1831,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
+      // Invalidate previous evidence before spawning: errors and aborts must not
+      // leave a prior successful benchmark available to log_experiment.
+      runtime.lastRunBenchmark = null;
+      runtime.lastRunChecks = null;
+      runtime.lastRunDuration = null;
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
@@ -2026,6 +2038,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       // Store checks result for log_experiment gate
+      runtime.lastRunBenchmark = { passed: benchmarkPassed, workDir };
       runtime.lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
 
       const passed = benchmarkPassed && (checksPass === null || checksPass);
@@ -2304,6 +2317,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const workDir = resolveWorkDir(ctx.cwd);
       const secondaryMetrics = params.metrics ?? {};
 
+      // A replayed session, interrupted command, or already-consumed result is
+      // not evidence that the current working tree passed its benchmark.
+      if (params.status === "keep" &&
+          (!runtime.lastRunBenchmark || runtime.lastRunBenchmark.workDir !== workDir)) {
+        return {
+          content: [{ type: "text", text: "❌ Cannot keep — run_experiment must complete successfully in this working directory first. Re-run after a restart, interruption, or previously logged result." }],
+          details: {},
+        };
+      }
+      if (params.status === "keep" && !runtime.lastRunBenchmark?.passed) {
+        return {
+          content: [{ type: "text", text: "❌ Cannot keep — the latest benchmark failed or timed out. Log as 'crash' or run a successful benchmark first." }],
+          details: {},
+        };
+      }
+
       // Gate: prevent "keep" when last run's checks failed
       if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
         return {
@@ -2534,6 +2563,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const wallClockSeconds = runtime.lastRunDuration;
       runtime.runningExperiment = null;
+      runtime.lastRunBenchmark = null;
       runtime.lastRunChecks = null;
       runtime.lastRunDuration = null;
 
@@ -3053,6 +3083,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         setAutoresearchMode(ctx, false);
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
+        runtime.lastRunBenchmark = null;
         runtime.lastRunChecks = null;
         runtime.lastRunDuration = null;
         runtime.runningExperiment = null;
@@ -3084,6 +3115,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         setAutoresearchMode(ctx, false);
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
+        runtime.lastRunBenchmark = null;
         runtime.lastRunChecks = null;
         runtime.lastRunDuration = null;
         runtime.runningExperiment = null;
