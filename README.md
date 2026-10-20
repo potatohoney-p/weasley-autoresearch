@@ -131,6 +131,50 @@ During an active clean session:
 
 Use an isolated Git worktree for unattended or high-risk optimization targets.
 
+### Candidate provenance
+
+Before benchmarking, AutoResearch records a read-only SHA-256 digest of `HEAD` and
+the repository-wide candidate: tracked and nonignored untracked file paths,
+contents, removals, file types, and Git-relevant executable modes. It compares the
+digest after correctness checks and again before a `keep` can change results or
+stage files. An observed change or capture failure disqualifies that run even if
+files are later restored; run a new benchmark before keeping. Fingerprinting time
+is excluded from benchmark and checks durations.
+
+The reserved `.auto/` and `autoresearch.hooks/` namespaces and known legacy session
+files are excluded from the candidate. Mutable logs, prompts and ideas therefore
+remain usable. Both current and legacy measure/checks files are explicitly
+fingerprinted even when ignored, with selected/resolved paths and absence markers. A
+benchmark path recognized by the existing command guard is also fingerprinted,
+including alternate legacy or nested paths. Ordinary source files such as
+`autoresearch.solver.py` are included. Missing or unreadable recognized benchmark
+paths fail before execution; on Windows, use a relative path instead of a Git Bash
+absolute path such as `/tmp/...` that native Node cannot resolve.
+
+Current/legacy layouts and custom commands retain their tool arguments. Staging
+different contents without changing the eventual working-tree contents is allowed,
+because `git add -A` replaces those staged contents. An index executable-mode change
+still matters when `core.filemode=false`. Nonignored generated outputs change the
+candidate: generate them before benchmarking, or ignore disposable build artifacts
+and rerun. `assume-unchanged` and `skip-worktree` index flags fail closed because
+they can prevent `git add -A` from staging tested bytes; intentionally clear those
+flags before benchmarking. Capture does not alter index flags or refresh the index.
+Submodules, unresolved index conflicts, unsupported file kinds, and
+symlink/non-directory ancestors of tracked candidate paths fail closed with an
+actionable error. Those cases are an explicit restriction, not universal backward
+compatibility.
+
+These are observational snapshots, not an atomic transaction or immutable execution
+environment. They cannot establish what an external process read, detect every
+transient edit that was restored between captures, or prevent edits racing the last
+comparison and commit. Ignored dependencies/data, arbitrary custom-command inputs,
+shell `PATH` resolution, environment variables and external services are outside the
+contract. These are working-tree byte snapshots, not a precomputed commit tree;
+Git content conversions and clean-filter execution are not fingerprinted. Candidate
+symlinks record their link text; their external targets are not
+implicitly included. Explicit benchmark/check control symlinks also include their
+resolved target file. This does not recursively fingerprint transitive dependencies.
+
 The consecutive-failure guard stops auto-resume after more than 20 rejected results
 (`discard`, `crash`, or `checks_failed`) in the current segment. A kept result or a new
 segment resets the streak. Persisted JSONL recovery skips malformed outcomes, unknown

@@ -52,6 +52,7 @@ import {
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
+import { captureCandidateProvenance, resolveBenchmarkPath } from "./provenance.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -179,7 +180,13 @@ interface AutoresearchRuntime {
   experimentsThisSession: number;
   autoResumeTurns: number;
   /** Only the latest completed benchmark in this runtime may authorize a keep. */
-  lastRunBenchmark: { passed: boolean; workDir: string } | null;
+  lastRunBenchmark: {
+    passed: boolean;
+    workDir: string;
+    candidateDigest: string;
+    invokedBenchmark: string | null;
+    provenanceError: string | null;
+  } | null;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
   lastRunDuration: number | null;
   runningExperiment: { startedAt: number; command: string } | null;
@@ -375,7 +382,7 @@ function killTree(pid: number): void {
  * pattern. Rejects chaining tricks like "evil.py; measure.sh" because we require
  * the benchmark script to be the *first* real command.
  */
-function isAutoresearchShCommand(command: string): boolean {
+function benchmarkPathFromCommand(command: string): string | null {
   let cmd = command.trim();
 
   // Strip leading env variable assignments: FOO=bar BAZ="qux" ...
@@ -393,7 +400,7 @@ function isAutoresearchShCommand(command: string): boolean {
   // Current layout requires the `.auto/measure.sh` path; legacy `autoresearch.sh`
   // is still accepted for in-flight sessions. An optional path prefix allows
   //   ./.auto/measure.sh, /abs/path/.auto/measure.sh, bash [-flags] autoresearch.sh, etc.
-  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\/|\.{1,2}\/|[\w.-]+\/)*(?:autoresearch\.sh|\.auto\/measure\.sh)(?:\s|$)/.test(cmd);
+  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?((?:\/|\.{1,2}\/|[\w.-]+\/)*(?:autoresearch\.sh|\.auto\/measure\.sh))(?:\s|$)/.exec(cmd)?.[1] ?? null;
 }
 
 function isBetter(
@@ -1808,7 +1815,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Guard: if the benchmark script exists, only allow running it
       const autoresearchShPath = autoresearchScriptPath(workDir);
       const benchmarkScriptRel = path.relative(workDir, autoresearchShPath) || path.basename(autoresearchShPath);
-      if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
+      const benchmarkCommandPath = benchmarkPathFromCommand(params.command);
+      if (fs.existsSync(autoresearchShPath) && !benchmarkCommandPath) {
         return {
           content: [{
             type: "text",
@@ -1836,6 +1844,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.lastRunBenchmark = null;
       runtime.lastRunChecks = null;
       runtime.lastRunDuration = null;
+      let candidateDigest: string;
+      let invokedBenchmark: string | null;
+      try {
+        invokedBenchmark = resolveBenchmarkPath(workDir, benchmarkCommandPath);
+        candidateDigest = captureCandidateProvenance(workDir, invokedBenchmark);
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `❌ Cannot run_experiment — cannot capture candidate provenance: ${error instanceof Error ? error.message : String(error)}. Fix the unsupported or unreadable input, then rerun.` }],
+          details: {},
+        };
+      }
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
@@ -2037,11 +2056,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      // Store checks result for log_experiment gate
-      runtime.lastRunBenchmark = { passed: benchmarkPassed, workDir };
+      // Snapshot work stays outside benchmark/check duration measurements.
+      let provenanceError: string | null = null;
+      if (benchmarkPassed && checksPass !== false) {
+        try {
+          if (captureCandidateProvenance(workDir, invokedBenchmark) !== candidateDigest) {
+            provenanceError = "candidate or benchmark/check inputs changed during the benchmark or correctness checks";
+          }
+        } catch (error) {
+          provenanceError = `cannot verify candidate provenance: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+      // Store checks and candidate evidence for the pre-mutation keep gate.
+      runtime.lastRunBenchmark = { passed: benchmarkPassed, workDir, candidateDigest, invokedBenchmark, provenanceError };
       runtime.lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
 
-      const passed = benchmarkPassed && (checksPass === null || checksPass);
+      const passed = benchmarkPassed && (checksPass === null || checksPass) && !provenanceError;
 
       // Reuse streaming temp file if it exists, otherwise create one for large output
       let fullOutputPath: string | undefined = streamTempFile;
@@ -2102,6 +2132,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
         text += `💥 CHECKS FAILED (.auto/checks.sh) in ${checksDuration.toFixed(1)}s\n`;
         text += `Log this as 'checks_failed' — the benchmark metric is valid but correctness checks did not pass.\n`;
+      } else if (provenanceError) {
+        text += `⚠️ Benchmark completed, but ${provenanceError}.\n`;
+        text += "Cannot keep this result. Generate nonignored outputs before benchmarking or ignore disposable build artifacts, then rerun the benchmark.\n";
       } else {
         text += `✅ PASSED in ${durationSeconds.toFixed(1)}s\n`;
         if (checksPass === true) {
@@ -2342,6 +2375,29 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }],
           details: {},
         };
+      }
+
+      if (params.status === "keep") {
+        const evidence = runtime.lastRunBenchmark!;
+        let provenanceError = evidence.provenanceError;
+        if (!provenanceError) {
+          try {
+            if (captureCandidateProvenance(workDir, evidence.invokedBenchmark) !== evidence.candidateDigest) {
+              provenanceError = "candidate or benchmark/check inputs changed after the benchmark";
+            }
+          } catch (error) {
+            provenanceError = `cannot verify candidate provenance: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
+        if (provenanceError) {
+          // An observed mismatch disqualifies this run, even if files are later
+          // restored. Only a fresh run may produce new passing evidence.
+          evidence.provenanceError = provenanceError;
+          return {
+            content: [{ type: "text", text: `❌ Cannot keep — ${provenanceError}. Rerun run_experiment after preparing the candidate; ignore disposable generated artifacts if needed.` }],
+            details: {},
+          };
+        }
       }
 
       // Validate secondary metrics consistency (after first experiment establishes them)
