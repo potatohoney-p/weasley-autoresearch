@@ -52,6 +52,7 @@ import {
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
+import { MetricCollector, metricLimitWarning, type MetricLimit } from "./metrics.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -160,6 +161,8 @@ interface RunDetails {
   checksDuration: number;
   /** Metrics parsed from METRIC lines in output. null if none found. */
   parsedMetrics: Record<string, number> | null;
+  /** Resource limits reached while collecting structured metrics. */
+  metricLimits: MetricLimit[];
   /** Primary metric value extracted from parsedMetrics (matching metricName). null if not found. */
   parsedPrimary: number | null;
   /** Name of the primary metric (for display) */
@@ -268,39 +271,6 @@ export const LogParams = Type.Object({
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/** Prefix for structured metric output lines: `METRIC name=value` */
-const METRIC_LINE_PREFIX = "METRIC";
-
-/**
- * Parse structured METRIC lines from command output.
- * Format: METRIC name=value (one per line)
- * Example:
- *   METRIC total_µs=15200
- *   METRIC compile_µs=4200
- *
- * Names must be word chars, dots, or µ (rejects `=` and other specials).
- * Values must be finite numbers (rejects Infinity, NaN, hex, etc.).
- * Duplicate names: last occurrence wins (allows scripts to refine values).
- * Returns a Map preserving insertion order of first occurrence per key.
- */
-/** Metric names that could cause prototype pollution if used as object keys */
-const DENIED_METRIC_NAMES = new Set(["__proto__", "constructor", "prototype"]);
-
-function parseMetricLines(output: string): Map<string, number> {
-  const metrics = new Map<string, number>();
-  const regex = new RegExp(`^${METRIC_LINE_PREFIX}\\s+([\\w.µ]+)=(\\S+)\\s*$`, "gm");
-  let match;
-  while ((match = regex.exec(output)) !== null) {
-    const name = match[1];
-    if (DENIED_METRIC_NAMES.has(name)) continue;
-    const value = Number(match[2]);
-    if (Number.isFinite(value)) {
-      metrics.set(name, value);
-    }
-  }
-  return metrics;
-}
 
 /** Format a number with comma-separated thousands: 15586 → "15,586" */
 function commas(n: number): string {
@@ -1832,6 +1802,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Spawn the process directly (like the bash tool) for streaming output
       const getTempFile = createTempFileAllocator();
+      const metricCollector = new MetricCollector();
       const { exitCode, killed: timedOut, output, tempFilePath: streamTempFile, actualTotalBytes } = await new Promise<{
         exitCode: number | null;
         killed: boolean;
@@ -1888,7 +1859,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           });
         }, 1000);
 
-        const handleData = (data: Buffer) => {
+        const handleData = (stream: "stdout" | "stderr", data: Buffer) => {
+          metricCollector.write(stream, data);
           totalBytes += data.length;
 
           // Start writing to temp file once we exceed the threshold
@@ -1928,8 +1900,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           chunksGeneration++;
         };
 
-        if (child.stdout) child.stdout.on("data", handleData);
-        if (child.stderr) child.stderr.on("data", handleData);
+        if (child.stdout) {
+          child.stdout.on("data", (data) => handleData("stdout", data));
+          child.stdout.on("end", () => metricCollector.end("stdout"));
+        }
+        if (child.stderr) {
+          child.stderr.on("data", (data) => handleData("stderr", data));
+          child.stderr.on("end", () => metricCollector.end("stderr"));
+        }
 
         // Timeout
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -1980,6 +1958,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }
 
           const fullBuffer = Buffer.concat(chunks);
+          metricCollector.end("stdout");
+          metricCollector.end("stderr");
           resolve({
             exitCode: code,
             killed: processTimedOut,
@@ -2050,8 +2030,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         maxBytes: EXPERIMENT_MAX_BYTES,
       });
 
-      // Parse structured METRIC lines from output
-      const parsedMetricMap = parseMetricLines(output);
+      // Collected before display eviction; each pipe has its own line decoder.
+      const { values: parsedMetricMap, limits: metricLimits } = metricCollector.snapshot();
       const parsedMetrics = parsedMetricMap.size > 0
         ? Object.fromEntries(parsedMetricMap)
         : null;
@@ -2070,6 +2050,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
         checksDuration,
         parsedMetrics,
+        metricLimits,
         parsedPrimary,
         metricName: state.metricName,
         metricUnit: state.metricUnit,
@@ -2099,6 +2080,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (state.bestMetric !== null) {
         text += `📊 Current best ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}\n`;
       }
+
+      if (metricLimits.length) text += `⚠️ ${metricLimitWarning(metricLimits)}\n`;
 
       // Show parsed METRIC lines to the LLM
       if (parsedMetrics) {
@@ -2185,6 +2168,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Helper: append tail output preview or full output
       const appendOutput = (text: string, output: string): string => {
+        const warning = metricLimitWarning(d.metricLimits ?? []);
+        if (warning) text += "\n" + theme.fg("warning", warning);
         if (!output) return text;
         const lines = output.split("\n");
         if (expanded) {
