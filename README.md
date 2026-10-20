@@ -92,6 +92,48 @@ All current session artifacts live under `.auto/` in the effective working direc
 
 Legacy flat `autoresearch.*` session files are read only for compatibility with in-flight sessions.
 
+## Recording a kept experiment
+
+`log_experiment` reports a kept result only after Git has a verified outcome and the JSONL append
+returns successfully. It checks HEAD before staging, accepts only exit 0 (unchanged) or 1 (changed)
+from `git diff --cached --quiet`, and verifies that a successful new commit advances HEAD. A keep
+with no staged changes remains valid and records the verified current HEAD, not a new commit.
+The caller's commit argument does not override this verified hash.
+
+A failure before a commit attempt returns an error without publishing a result, incrementing the
+experiment counter, or firing success hooks. Repair the reported problem before retrying. Staging
+may already have happened; the extension leaves the working tree and index as Git left them.
+
+If a commit fails, times out, or cannot be verified, its outcome is **uncertain**: Git may already
+have created it. An append error is also uncertain, because a partial or complete log entry may
+have been written before the error. Autoresearch pauses and rejects further experiment calls.
+Inspect HEAD, the index and `.auto/log.jsonl` (or the active legacy log), reconcile them, then
+explicitly resume with `/autoresearch <goal>`. Do not blindly repeat the keep or append a duplicate.
+The response includes the verified Git hash when available. No commit rollback, index reset, log
+repair, or automatic retry is performed.
+
+Explicit resume rebuilds runtime state from the reconciled log, preserving any complete result
+you retained. The log must be readable, contain complete JSON objects on nonempty lines and end
+with a newline before further appends. Invalid or missing logs keep the session paused; repair
+them manually or use the explicit clear command to reset the session. Resume does not fall back
+to stale tool history or certify that your manual Git/log reconciliation was correct. Previous
+benchmark/check timing evidence is cleared; run a fresh benchmark before the next decision.
+
+While a log operation is pending, other log calls, initialization, benchmark runs, clearing and
+restarting that same runtime are rejected; `/autoresearch off` remains available. Successful
+keeps publish their state before updating the dashboard and running hooks. The existing session
+activation record preserves a pause across same-session reloads when saving that record succeeds;
+failure to save the pause or abort the loop is reported explicitly.
+
+After publication, hook invocation or steering-delivery errors are reported as warnings alongside
+the recorded success, not as an uncertain keep. Per-run checks and timing are consumed before
+these follow-up actions. Do not repeat an already-recorded keep just because its hook failed.
+
+This is in-process outcome reporting, not an atomic Git/log transaction or a recovery journal.
+It does not lock other sessions or external writers, guarantee physical durability, or recover
+automatically after process death. A different session has no new persisted uncertainty marker.
+Discard/crash rollback behavior is unchanged.
+
 ## Configuration
 
 `.auto/config.json` accepts exactly these optional fields:
