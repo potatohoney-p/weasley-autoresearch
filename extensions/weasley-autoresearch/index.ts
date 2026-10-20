@@ -52,6 +52,7 @@ import {
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
+import { commitKeptCandidate } from "./keep.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -176,6 +177,10 @@ interface LogDetails {
 
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
+  /** In-process serialization only; other sessions and external writers are not locked. */
+  logInProgress: boolean;
+  /** Explicit command-level reconciliation/resume is required after an uncertain keep. */
+  keepReconciliationRequired: boolean;
   experimentsThisSession: number;
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
@@ -794,6 +799,8 @@ function createExperimentState(): ExperimentState {
 function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
+    logInProgress: false,
+    keepReconciliationRequired: false,
     experimentsThisSession: 0,
     autoResumeTurns: 0,
     lastRunChecks: null,
@@ -1195,6 +1202,39 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const cancelPendingResume = (runtime: AutoresearchRuntime): void => {
     pausePendingResume(runtime);
     runtime.pendingResumeMessage = null;
+  };
+
+  const logBusyResult = () => ({
+    content: [{ type: "text" as const, text: "An experiment log operation is in progress. Wait for its outcome before changing the session or running another experiment." }],
+    details: {},
+    isError: true,
+  });
+
+  const reconciliationResult = () => ({
+    content: [{ type: "text" as const, text: "A previous keep has an uncertain Git or log outcome. Inspect HEAD, the index and the session log and reconcile them, then explicitly resume with /autoresearch <goal>. Automatic retries are blocked." }],
+    details: {},
+    isError: true,
+  });
+
+  const pauseUncertainKeep = (ctx: ExtensionContext, workDir: string): string => {
+    const runtime = getRuntime(ctx);
+    // Stop automatic continuation even if persisting the OFF record or aborting fails.
+    runtime.autoresearchMode = false;
+    runtime.keepReconciliationRequired = true;
+    cancelPendingResume(runtime);
+    runtime.lastRunChecks = null;
+    runtime.lastRunDuration = null;
+    runtime.runningExperiment = null;
+    const warnings: string[] = [];
+    for (const [label, action] of [
+      ["disable tools", () => setAutoresearchMode(ctx, false)],
+      ["persist session pause", () => recordAutoresearchActivation(workDir, false)],
+      ["abort current loop", () => ctx.abort()],
+    ] as const) {
+      try { action(); }
+      catch (error) { warnings.push(`Could not ${label}: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    return warnings.length ? `\n${warnings.join("\n")}` : "";
   };
 
   const markAutoResumeSent = (runtime: AutoresearchRuntime): void => {
@@ -1653,6 +1693,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
+      if (runtime.logInProgress) return logBusyResult();
+      if (runtime.keepReconciliationRequired) return reconciliationResult();
       const state = runtime.state;
 
       // Validate working directory exists
@@ -1773,6 +1815,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const runtime = getRuntime(ctx);
+      if (runtime.logInProgress) return logBusyResult();
+      if (runtime.keepReconciliationRequired) return reconciliationResult();
       const state = runtime.state;
 
       // Validate working directory exists
@@ -2178,7 +2222,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const d = result.details as (RunDetails & { truncation?: any; fullOutputPath?: string }) | undefined;
-      if (!d) {
+      if (!d || typeof d.durationSeconds !== "number") {
         const t = result.content[0];
         return new Text(t?.type === "text" ? t.text : "", 0, 0);
       }
@@ -2291,282 +2335,289 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
-      const state = runtime.state;
+      if (runtime.logInProgress) return logBusyResult();
+      if (runtime.keepReconciliationRequired) return reconciliationResult();
+      runtime.logInProgress = true;
+      try {
+        // A keep is published only after its Git outcome and log append succeed.
+        const state = params.status === "keep" ? cloneExperimentState(runtime.state) : runtime.state;
 
-      // Validate working directory exists
-      const workDirError = validateWorkDir(ctx.cwd);
-      if (workDirError) {
-        return {
-          content: [{ type: "text", text: `❌ ${workDirError}` }],
-          details: {},
-        };
-      }
-      const workDir = resolveWorkDir(ctx.cwd);
-      const secondaryMetrics = params.metrics ?? {};
+        // Validate working directory exists
+        const workDirError = validateWorkDir(ctx.cwd);
+        if (workDirError) {
+          return {
+            content: [{ type: "text", text: `❌ ${workDirError}` }],
+            details: {},
+          };
+        }
+        const workDir = resolveWorkDir(ctx.cwd);
+        const secondaryMetrics = params.metrics ?? {};
 
-      // Gate: prevent "keep" when last run's checks failed
-      if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
-        return {
-          content: [{
-            type: "text",
-            text: `❌ Cannot keep — .auto/checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
-          }],
-          details: {},
-        };
-      }
-
-      // Validate secondary metrics consistency (after first experiment establishes them)
-      if (state.secondaryMetrics.length > 0) {
-        const knownNames = new Set(state.secondaryMetrics.map((m) => m.name));
-        const providedNames = new Set(Object.keys(secondaryMetrics));
-
-        // Check for missing metrics
-        const missing = [...knownNames].filter((n) => !providedNames.has(n));
-        if (missing.length > 0) {
+        // Gate: prevent "keep" when last run's checks failed
+        if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
           return {
             content: [{
               type: "text",
-              text: `❌ Missing secondary metrics: ${missing.join(", ")}\n\nYou must provide all previously tracked metrics. Expected: ${[...knownNames].join(", ")}\nGot: ${[...providedNames].join(", ") || "(none)"}\n\nFix: include ${missing.map((m) => `"${m}": <value>`).join(", ")} in the metrics parameter.`,
+              text: `❌ Cannot keep — .auto/checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
             }],
             details: {},
           };
         }
 
-        // Check for new metrics not yet tracked
-        const newMetrics = [...providedNames].filter((n) => !knownNames.has(n));
-        if (newMetrics.length > 0 && !params.force) {
-          return {
-            content: [{
-              type: "text",
-              text: `❌ New secondary metric${newMetrics.length > 1 ? "s" : ""} not previously tracked: ${newMetrics.join(", ")}\n\nExisting metrics: ${[...knownNames].join(", ")}\n\nIf this metric has proven very valuable to watch, call log_experiment again with force: true to add it. Otherwise, remove it from the metrics parameter.`,
-            }],
-            details: {},
-          };
-        }
-      }
+        // Validate secondary metrics consistency (after first experiment establishes them)
+        if (state.secondaryMetrics.length > 0) {
+          const knownNames = new Set(state.secondaryMetrics.map((m) => m.name));
+          const providedNames = new Set(Object.keys(secondaryMetrics));
 
-      // ASI: agent-supplied free-form diagnostics
-      const mergedASI = (params.asi && Object.keys(params.asi).length > 0)
-        ? params.asi as ASI
-        : undefined;
-
-      const experiment: ExperimentResult = {
-        commit: params.commit.slice(0, 7),
-        metric: params.metric,
-        metrics: secondaryMetrics,
-        status: params.status,
-        description: params.description,
-        timestamp: Date.now(),
-        segment: state.currentSegment,
-        confidence: null,
-        asi: mergedASI,
-      };
-
-      state.results.push(experiment);
-      runtime.experimentsThisSession++;
-
-      // Register any new secondary metric names
-      for (const name of Object.keys(secondaryMetrics)) {
-        if (!state.secondaryMetrics.find((m) => m.name === name)) {
-          let unit = "";
-          if (name.endsWith("µs")) unit = "µs";
-          else if (name.endsWith("_ms")) unit = "ms";
-          else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
-          else if (name.endsWith("_kb")) unit = "kb";
-          else if (name.endsWith("_mb")) unit = "mb";
-          state.secondaryMetrics.push({ name, unit });
-        }
-      }
-
-      // Baseline = first run in current segment
-      state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
-
-      // Compute confidence score (best improvement as multiple of noise floor)
-      state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
-      experiment.confidence = state.confidence;
-
-      // Build response text
-      const segmentCount = currentResults(state.results, state.currentSegment).length;
-      let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
-
-      if (state.bestMetric !== null) {
-        text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
-        if (segmentCount > 1 && params.status === "keep" && params.metric > 0) {
-          const delta = params.metric - state.bestMetric;
-          const pct = ((delta / state.bestMetric) * 100).toFixed(1);
-          const sign = delta > 0 ? "+" : "";
-          text += ` | this: ${formatNum(params.metric, state.metricUnit)} (${sign}${pct}%)`;
-        }
-      }
-
-      // Show secondary metrics
-      if (Object.keys(secondaryMetrics).length > 0) {
-        const baselines = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
-        const parts: string[] = [];
-        for (const [name, value] of Object.entries(secondaryMetrics)) {
-          const def = state.secondaryMetrics.find((m) => m.name === name);
-          const unit = def?.unit ?? "";
-          let part = `${name}: ${formatNum(value, unit)}`;
-          const bv = baselines[name];
-          if (bv !== undefined && state.results.length > 1 && bv !== 0) {
-            const d = value - bv;
-            const p = ((d / bv) * 100).toFixed(1);
-            const s = d > 0 ? "+" : "";
-            part += ` (${s}${p}%)`;
+          // Check for missing metrics
+          const missing = [...knownNames].filter((n) => !providedNames.has(n));
+          if (missing.length > 0) {
+            return {
+              content: [{
+                type: "text",
+                text: `❌ Missing secondary metrics: ${missing.join(", ")}\n\nYou must provide all previously tracked metrics. Expected: ${[...knownNames].join(", ")}\nGot: ${[...providedNames].join(", ") || "(none)"}\n\nFix: include ${missing.map((m) => `"${m}": <value>`).join(", ")} in the metrics parameter.`,
+              }],
+              details: {},
+            };
           }
-          parts.push(part);
-        }
-        text += `\nSecondary: ${parts.join("  ")}`;
-      }
 
-      // Show ASI summary
-      if (mergedASI) {
-        const asiParts: string[] = [];
-        for (const [k, v] of Object.entries(mergedASI)) {
-          const s = typeof v === "string" ? v : JSON.stringify(v);
-          asiParts.push(`${k}: ${s.length > 80 ? s.slice(0, 77) + "…" : s}`);
+          // Check for new metrics not yet tracked
+          const newMetrics = [...providedNames].filter((n) => !knownNames.has(n));
+          if (newMetrics.length > 0 && !params.force) {
+            return {
+              content: [{
+                type: "text",
+                text: `❌ New secondary metric${newMetrics.length > 1 ? "s" : ""} not previously tracked: ${newMetrics.join(", ")}\n\nExisting metrics: ${[...knownNames].join(", ")}\n\nIf this metric has proven very valuable to watch, call log_experiment again with force: true to add it. Otherwise, remove it from the metrics parameter.`,
+              }],
+              details: {},
+            };
+          }
         }
-        if (asiParts.length > 0) {
-          text += `\n📋 ASI: ${asiParts.join(" | ")}`;
+
+        // ASI: agent-supplied free-form diagnostics
+        const mergedASI = (params.asi && Object.keys(params.asi).length > 0)
+          ? params.asi as ASI
+          : undefined;
+
+        const experiment: ExperimentResult = {
+          commit: params.commit.slice(0, 7),
+          metric: params.metric,
+          metrics: secondaryMetrics,
+          status: params.status,
+          description: params.description,
+          timestamp: Date.now(),
+          segment: state.currentSegment,
+          confidence: null,
+          asi: mergedASI,
+        };
+
+        state.results.push(experiment);
+        if (params.status !== "keep") runtime.experimentsThisSession++;
+
+        // Register any new secondary metric names
+        for (const name of Object.keys(secondaryMetrics)) {
+          if (!state.secondaryMetrics.find((m) => m.name === name)) {
+            let unit = "";
+            if (name.endsWith("µs")) unit = "µs";
+            else if (name.endsWith("_ms")) unit = "ms";
+            else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
+            else if (name.endsWith("_kb")) unit = "kb";
+            else if (name.endsWith("_mb")) unit = "mb";
+            state.secondaryMetrics.push({ name, unit });
+          }
         }
-      }
 
-      // Show confidence score
-      if (state.confidence !== null) {
-        const confStr = state.confidence.toFixed(1);
-        if (state.confidence >= 2.0) {
-          text += `\n📊 Confidence: ${confStr}× noise floor — improvement is likely real`;
-        } else if (state.confidence >= 1.0) {
-          text += `\n📊 Confidence: ${confStr}× noise floor — improvement is above noise but marginal`;
-        } else {
-          text += `\n⚠️ Confidence: ${confStr}× noise floor — improvement is within noise. Consider re-running to confirm before keeping.`;
+        // Baseline = first run in current segment
+        state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
+
+        // Compute confidence score (best improvement as multiple of noise floor)
+        state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+        experiment.confidence = state.confidence;
+
+        // Build response text
+        const segmentCount = currentResults(state.results, state.currentSegment).length;
+        let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
+
+        if (state.bestMetric !== null) {
+          text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
+          if (segmentCount > 1 && params.status === "keep" && params.metric > 0) {
+            const delta = params.metric - state.bestMetric;
+            const pct = ((delta / state.bestMetric) * 100).toFixed(1);
+            const sign = delta > 0 ? "+" : "";
+            text += ` | this: ${formatNum(params.metric, state.metricUnit)} (${sign}${pct}%)`;
+          }
         }
-      }
 
-      text += `\n(${segmentCount} experiments`;
-      if (state.maxExperiments !== null) {
-        text += ` / ${state.maxExperiments} max`;
-      }
-      text += `)`;
+        // Show secondary metrics
+        if (Object.keys(secondaryMetrics).length > 0) {
+          const baselines = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
+          const parts: string[] = [];
+          for (const [name, value] of Object.entries(secondaryMetrics)) {
+            const def = state.secondaryMetrics.find((m) => m.name === name);
+            const unit = def?.unit ?? "";
+            let part = `${name}: ${formatNum(value, unit)}`;
+            const bv = baselines[name];
+            if (bv !== undefined && state.results.length > 1 && bv !== 0) {
+              const d = value - bv;
+              const p = ((d / bv) * 100).toFixed(1);
+              const s = d > 0 ? "+" : "";
+              part += ` (${s}${p}%)`;
+            }
+            parts.push(part);
+          }
+          text += `\nSecondary: ${parts.join("  ")}`;
+        }
 
-      // Auto-commit only on keep — discards/crashes get reverted anyway
-      if (params.status === "keep") {
-        try {
+        // Show ASI summary
+        if (mergedASI) {
+          const asiParts: string[] = [];
+          for (const [k, v] of Object.entries(mergedASI)) {
+            const s = typeof v === "string" ? v : JSON.stringify(v);
+            asiParts.push(`${k}: ${s.length > 80 ? s.slice(0, 77) + "…" : s}`);
+          }
+          if (asiParts.length > 0) {
+            text += `\n📋 ASI: ${asiParts.join(" | ")}`;
+          }
+        }
+
+        // Show confidence score
+        if (state.confidence !== null) {
+          const confStr = state.confidence.toFixed(1);
+          if (state.confidence >= 2.0) {
+            text += `\n📊 Confidence: ${confStr}× noise floor — improvement is likely real`;
+          } else if (state.confidence >= 1.0) {
+            text += `\n📊 Confidence: ${confStr}× noise floor — improvement is above noise but marginal`;
+          } else {
+            text += `\n⚠️ Confidence: ${confStr}× noise floor — improvement is within noise. Consider re-running to confirm before keeping.`;
+          }
+        }
+
+        text += `\n(${segmentCount} experiments`;
+        if (state.maxExperiments !== null) {
+          text += ` / ${state.maxExperiments} max`;
+        }
+        text += `)`;
+
+        // Auto-commit only on keep — discards/crashes get reverted anyway
+        let verifiedCommit: string | undefined;
+        if (params.status === "keep") {
           const resultData: Record<string, unknown> = {
             status: params.status,
             [state.metricName || "metric"]: params.metric,
             ...secondaryMetrics,
           };
-          const trailerJson = JSON.stringify(resultData);
-          const commitMsg = `${params.description}\n\nResult: ${trailerJson}`;
-
-          const execOpts = { cwd: workDir, timeout: 10000 };
-          const addResult = await pi.exec("git", ["add", "-A"], execOpts);
-          if (addResult.code !== 0) {
-            const addErr = (addResult.stdout + addResult.stderr).trim();
-            throw new Error(`git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`);
+          const commitMsg = `${params.description}\n\nResult: ${JSON.stringify(resultData)}`;
+          const outcome = await commitKeptCandidate((...args) => pi.exec(...args), workDir, commitMsg);
+          if (!outcome.ok) {
+            const pauseWarnings = outcome.uncertain ? pauseUncertainKeep(ctx, workDir) : "";
+            const guidance = outcome.uncertain
+              ? "Git outcome is uncertain. Autoresearch is paused. Inspect HEAD, the index and the session log, reconcile them, then explicitly resume. Do not automatically retry this keep."
+              : "No commit was attempted. Inspect and repair the reported problem before retrying; any staging already performed is preserved.";
+            return {
+              content: [{ type: "text", text: `❌ Keep was not recorded (${outcome.phase}): ${outcome.message}\n${guidance}${outcome.beforeHead ? `\nHEAD before operation: ${outcome.beforeHead}` : ""}${pauseWarnings}` }],
+              details: { keepOutcome: outcome },
+              isError: true,
+            };
           }
-
-          const diffResult = await pi.exec("git", ["diff", "--cached", "--quiet"], execOpts);
-          if (diffResult.code === 0) {
-            text += `\n📝 Git: nothing to commit (working tree clean)`;
-          } else {
-            const gitResult = await pi.exec("git", ["commit", "-m", commitMsg], execOpts);
-            const gitOutput = (gitResult.stdout + gitResult.stderr).trim();
-            if (gitResult.code === 0) {
-              const firstLine = gitOutput.split("\n")[0] || "";
-              text += `\n📝 Git: committed — ${firstLine}`;
-
-              try {
-                const shaResult = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 });
-                const newSha = (shaResult.stdout || "").trim();
-                if (newSha && newSha.length >= 7) {
-                  experiment.commit = newSha;
-                }
-              } catch {
-                // Keep the original commit hash if rev-parse fails
-              }
-            } else {
-              text += `\n⚠️ Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`;
-            }
-          }
-        } catch (e) {
-          text += `\n⚠️ Git commit error: ${e instanceof Error ? e.message : String(e)}`;
+          verifiedCommit = outcome.commit;
+          experiment.commit = outcome.commit.slice(0, 7);
+          text += outcome.createdCommit
+            ? `\n📝 Git: committed — ${experiment.commit}`
+            : `\n📝 Git: nothing to commit; using current HEAD ${experiment.commit}`;
         }
-      }
 
-      const jsonlEntry: Record<string, unknown> = {
-        run: state.results.length,
-        ...experiment,
-      };
-      if (!mergedASI) delete jsonlEntry.asi;
-      const jsonlLine = JSON.stringify(jsonlEntry);
+        const jsonlEntry: Record<string, unknown> = {
+          run: state.results.length,
+          ...experiment,
+        };
+        if (!mergedASI) delete jsonlEntry.asi;
+        const jsonlLine = JSON.stringify(jsonlEntry);
 
-      try {
-        const jsonlPath = autoresearchJsonlPath(workDir);
-        ensureParentDir(jsonlPath);
-        fs.appendFileSync(jsonlPath, jsonlLine + "\n");
-        broadcastDashboardUpdate(workDir);
-      } catch (e) {
-        text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
-      }
-
-      if (params.status !== "keep") {
         try {
-          const revertScript = `
-            git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
-            git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
-          `;
-          await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
-          text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
+          const jsonlPath = autoresearchJsonlPath(workDir);
+          ensureParentDir(jsonlPath);
+          fs.appendFileSync(jsonlPath, jsonlLine + "\n");
         } catch (e) {
-          text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+          if (params.status === "keep") {
+            const pauseWarnings = pauseUncertainKeep(ctx, workDir);
+            return {
+              content: [{ type: "text", text: `❌ Keep log persistence is uncertain: ${e instanceof Error ? e.message : String(e)}\nVerified Git HEAD: ${verifiedCommit}\nAutoresearch is paused. The append may have written a partial or complete entry. Inspect HEAD, the index and the session log, reconcile them, then explicitly resume. Do not automatically retry or append a duplicate.${pauseWarnings}` }],
+              details: { keepOutcome: { ok: false, phase: "append", uncertain: true, commit: verifiedCommit } },
+              isError: true,
+            };
+          }
+          text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
         }
-      }
 
-      const afterSteer = await fireHook({
-        event: "after",
-        cwd: workDir,
-        run_entry: jsonlEntry,
-        session: buildSessionSnapshot(state),
-      });
-      if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
+        if (params.status === "keep") {
+          // Preserve the state object captured by an open fullscreen dashboard.
+          Object.assign(runtime.state, state);
+          runtime.experimentsThisSession++;
+        }
+        try { broadcastDashboardUpdate(workDir); }
+        catch (error) {
+          text += `\n⚠️ Dashboard refresh failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
 
-      const wallClockSeconds = runtime.lastRunDuration;
-      runtime.runningExperiment = null;
-      runtime.lastRunChecks = null;
-      runtime.lastRunDuration = null;
+        if (params.status !== "keep") {
+          try {
+            const revertScript = `
+              git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
+              git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
+            `;
+            await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
+            text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
+          } catch (e) {
+            text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+          }
+        }
 
-      const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
-      if (limitReached) {
-        text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
-        recordAutoresearchActivation(workDir, false);
-        setAutoresearchMode(ctx, false);
-        ctx.abort();
-      } else if (runtime.autoresearchMode) {
-        const beforeSteer = await fireHook({
-          event: "before",
+        const afterSteer = await fireHook({
+          event: "after",
           cwd: workDir,
-          next_run: state.results.length + 1,
-          last_run: jsonlEntry,
+          run_entry: jsonlEntry,
           session: buildSessionSnapshot(state),
         });
-        if (beforeSteer) pi.sendUserMessage(beforeSteer, { deliverAs: "steer" });
+        if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
+
+        const wallClockSeconds = runtime.lastRunDuration;
+        runtime.runningExperiment = null;
+        runtime.lastRunChecks = null;
+        runtime.lastRunDuration = null;
+
+        const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
+        if (limitReached) {
+          text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
+          recordAutoresearchActivation(workDir, false);
+          setAutoresearchMode(ctx, false);
+          ctx.abort();
+        } else if (runtime.autoresearchMode) {
+          const beforeSteer = await fireHook({
+            event: "before",
+            cwd: workDir,
+            next_run: state.results.length + 1,
+            last_run: jsonlEntry,
+            session: buildSessionSnapshot(state),
+          });
+          if (beforeSteer) pi.sendUserMessage(beforeSteer, { deliverAs: "steer" });
+        }
+
+        updateWidget(ctx);
+
+        // Refresh fullscreen overlay if open
+        if (overlayTui) overlayTui.requestRender();
+
+        return {
+          content: [{ type: "text", text }],
+          details: {
+            experiment: { ...experiment, metrics: { ...experiment.metrics } },
+            state: cloneExperimentState(state),
+            wallClockSeconds,
+          } as LogDetails,
+        };
+      } finally {
+        runtime.logInProgress = false;
       }
-
-      updateWidget(ctx);
-
-      // Refresh fullscreen overlay if open
-      if (overlayTui) overlayTui.requestRender();
-
-      return {
-        content: [{ type: "text", text }],
-        details: {
-          experiment: { ...experiment, metrics: { ...experiment.metrics } },
-          state: cloneExperimentState(state),
-          wallClockSeconds,
-        } as LogDetails,
-      };
     },
 
     renderCall(args, theme) {
@@ -2584,7 +2635,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     renderResult(result, _options, theme) {
       const d = result.details as LogDetails | undefined;
-      if (!d) {
+      if (!d?.experiment || !d.state) {
         const t = result.content[0];
         return new Text(t?.type === "text" ? t.text : "", 0, 0);
       }
@@ -3072,6 +3123,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (runtime.logInProgress) {
+        ctx.ui.notify("An experiment log operation is in progress. Wait for its outcome before clearing or restarting the session; /autoresearch off remains available.", "warning");
+        return;
+      }
+
       if (command === "clear") {
         let workDir = ctx.cwd;
         try {
@@ -3107,6 +3163,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }
         }
 
+        runtime.keepReconciliationRequired = false;
         if (deletedPaths.length > 0) {
           ctx.ui.notify(`Deleted ${deletedPaths.join(", ")} and turned autoresearch mode OFF`, "info");
         } else {
@@ -3131,8 +3188,44 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`Autoresearch not activated: ${activationError}`, "error");
         return;
       }
-      recordAutoresearchActivation(workDir, true);
-      setAutoresearchMode(ctx, true);
+      const reconciling = runtime.keepReconciliationRequired;
+      if (reconciling) {
+        try {
+          // Explicit resume reads the user's reconciled log, never stale tool history.
+          // Do not repair/truncate bytes or silently skip a partially appended line.
+          const content = fs.readFileSync(autoresearchJsonlPath(workDir), "utf8");
+          if (content && !content.endsWith("\n")) throw new Error("The log must end with a newline before another append.");
+          for (const line of content.split("\n")) {
+            if (line.trim() && !parseJsonlEntry(line)) throw new Error("Every nonempty log line must be a complete JSON object.");
+          }
+          const restored = {
+            ...createExperimentState(),
+            ...reconstructJsonlState(content),
+            maxExperiments: readMaxExperiments(ctx.cwd),
+          };
+          restored.bestMetric = findBaselineMetric(restored.results, restored.currentSegment);
+          restored.confidence = computeConfidence(restored.results, restored.currentSegment, restored.bestDirection);
+          Object.assign(runtime.state, restored);
+          runtime.lastRunChecks = null;
+          runtime.lastRunDuration = null;
+          runtime.runningExperiment = null;
+          runtime.experimentsThisSession = 0;
+          cancelPendingResume(runtime);
+        } catch (error) {
+          ctx.ui.notify(`Cannot resume from the reconciled session log: ${error instanceof Error ? error.message : String(error)} Repair it manually, or explicitly clear the session to reset it. Autoresearch remains paused.`, "error");
+          return;
+        }
+      }
+      try {
+        recordAutoresearchActivation(workDir, true);
+        setAutoresearchMode(ctx, true);
+      } catch (error) {
+        if (!reconciling) throw error;
+        const warnings = pauseUncertainKeep(ctx, workDir);
+        ctx.ui.notify(`Could not resume the reconciled session: ${error instanceof Error ? error.message : String(error)}${warnings}`, "error");
+        return;
+      }
+      runtime.keepReconciliationRequired = false;
       runtime.autoResumeTurns = 0;
       const rulesLoaded = hasAutoresearchRules(ctx);
       // No .auto/prompt.md yet — load the create skill so the agent follows the
