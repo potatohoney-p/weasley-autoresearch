@@ -61,9 +61,16 @@ parse_groups() {
   # Serialize JSON fields into flat files so bash can consume them without jq.
   # Node is already a dependency (used by the extension), so no new dep required.
   DATA_DIR=$(mktemp -d)
-  # Keep paths out of JavaScript source. Passing argv also lets Git Bash convert
-  # its POSIX paths for native Windows Node.
-  node - "$groups_file" "$DATA_DIR" <<'NODE' || fail "Failed to parse $groups_file — check JSON syntax."
+  # Keep paths out of JavaScript source. Explicitly convert for native Windows
+  # Node: Git Bash's automatic argv conversion skips some quoted paths.
+  local node_groups_file="$groups_file" node_data_dir="$DATA_DIR"
+  case "$OSTYPE" in
+    msys*|cygwin*)
+      node_groups_file=$(cygpath -m "$groups_file")
+      node_data_dir=$(cygpath -m "$DATA_DIR")
+      ;;
+  esac
+  node - "$node_groups_file" "$node_data_dir" <<'NODE' || fail "Failed to parse $groups_file — check JSON syntax."
 const fs = require('fs');
 const config = JSON.parse(fs.readFileSync(process.argv[2], 'utf-8'));
 const outDir = process.argv[3];
