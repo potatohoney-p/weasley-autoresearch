@@ -131,6 +131,40 @@ During an active clean session:
 
 Use an isolated Git worktree for unattended or high-risk optimization targets.
 
+### Benchmark invocation
+
+When the selected `.auto/measure.sh` (or legacy `autoresearch.sh`) exists,
+`run_experiment` requires one complete literal benchmark invocation. It does not
+accept a matching command prefix followed by shell syntax that can mask failure.
+For example, `bash -n .auto/measure.sh`, `bash .auto/measure.sh || true`, and
+`bash .auto/measure.sh | cat` are rejected before any benchmark or checks run.
+Every attempted run clears earlier evidence, including a rejected invocation;
+run a fresh valid benchmark before keeping.
+
+Supported forms retain literal script arguments and quoted/escaped paths:
+
+- `bash .auto/measure.sh`, `sh .auto/measure.sh`, or `./.auto/measure.sh`.
+- `source .auto/measure.sh` directly (or under Bash's `time` keyword).
+- Current, legacy, nested, and absolute recognized benchmark paths. Direct or
+  sourced legacy paths need `./autoresearch.sh`, not a bare PATH lookup.
+- Optional shell flags composed only of `e`, `u`, `x`, and `v`, plus optional `--`.
+- Literal leading environment assignments, or `env [--] NAME=value ...`.
+- Basic `time [-p]`, `nice [-n INTEGER] [--]`, and `nohup [--]` wrappers, when
+  available. `env`, `nice`, and `nohup` cannot directly invoke the `source` builtin.
+
+Other wrapper/interpreter options, chaining, pipelines, backgrounding, redirection,
+comments, unquoted newlines, substitutions, variable/glob/brace/tilde expansion, and malformed quoting
+are unsupported. Explicit assignments to `BASH_ENV`, `ENV`, `SHELLOPTS`, or
+`BASHOPTS` are also rejected because startup settings can skip script execution.
+Put complex setup inside the benchmark script and make it propagate failures.
+Quoted literal arguments may contain shell-looking characters without evaluating them.
+
+If no selected benchmark file exists, custom shell commands remain available with
+their existing exit-status semantics. This validation is not a security sandbox or
+proof of what a benchmark script does. Ambient environment, PATH/interpreter
+resolution, the script's own argument handling (including a script-defined `--help`)
+and exit-status discipline remain the caller's responsibility.
+
 ### Candidate provenance
 
 Before benchmarking, AutoResearch records a read-only SHA-256 digest of `HEAD` and
