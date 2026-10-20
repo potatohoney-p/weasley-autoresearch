@@ -10,6 +10,8 @@ export interface AutoresearchConfigEntry extends JsonlEntry {
 
 export interface AutoresearchRunEntry extends JsonlEntry {
   run: number;
+  metric: number;
+  status: "keep" | "discard" | "crash" | "checks_failed";
 }
 
 export interface ReconstructedMetricDef {
@@ -66,16 +68,9 @@ function metricMapFrom(value: unknown): Record<string, number> {
 
   const metrics: Record<string, number> = {};
   for (const [name, metric] of Object.entries(value)) {
-    if (typeof metric === "number") metrics[name] = metric;
+    if (typeof metric === "number" && Number.isFinite(metric)) metrics[name] = metric;
   }
   return metrics;
-}
-
-function statusFrom(value: unknown): ReconstructedRun["status"] {
-  if (value === "discard") return "discard";
-  if (value === "crash") return "crash";
-  if (value === "checks_failed") return "checks_failed";
-  return "keep";
 }
 
 function directionFrom(value: unknown): ReconstructedJsonlState["bestDirection"] {
@@ -113,15 +108,15 @@ function nextSegment(state: ReconstructedJsonlState, segment: number): number {
 
 function runFrom(entry: AutoresearchRunEntry, segment: number): ReconstructedRun {
   return {
-    run: typeof entry.run === "number" ? entry.run : 0,
+    run: entry.run,
     commit: typeof entry.commit === "string" ? entry.commit : "",
-    metric: typeof entry.metric === "number" ? entry.metric : 0,
+    metric: entry.metric,
     metrics: metricMapFrom(entry.metrics),
-    status: statusFrom(entry.status),
+    status: entry.status,
     description: typeof entry.description === "string" ? entry.description : "",
-    timestamp: typeof entry.timestamp === "number" ? entry.timestamp : 0,
+    timestamp: typeof entry.timestamp === "number" && Number.isFinite(entry.timestamp) ? entry.timestamp : 0,
     segment,
-    confidence: typeof entry.confidence === "number" ? entry.confidence : null,
+    confidence: typeof entry.confidence === "number" && Number.isFinite(entry.confidence) ? entry.confidence : null,
     asi: asiFrom(entry.asi),
   };
 }
@@ -147,7 +142,11 @@ export function isAutoresearchConfigEntry(entry: unknown): entry is Autoresearch
 }
 
 export function isAutoresearchRunEntry(entry: unknown): entry is AutoresearchRunEntry {
-  return isObjectRecord(entry) && typeof entry.run === "number";
+  return isObjectRecord(entry) && entry.type === undefined &&
+    typeof entry.run === "number" && Number.isSafeInteger(entry.run) && entry.run > 0 &&
+    typeof entry.metric === "number" && Number.isFinite(entry.metric) &&
+    (entry.status === "keep" || entry.status === "discard" ||
+     entry.status === "crash" || entry.status === "checks_failed");
 }
 
 function firstConfigEntry(jsonlContent: string): AutoresearchConfigEntry | null {

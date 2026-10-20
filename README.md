@@ -121,11 +121,21 @@ modified.
 During an active clean session:
 
 - `keep` stages and commits the experiment result.
+- `keep` requires the latest `run_experiment` in the same working directory to have
+  completed successfully, including configured correctness checks. A result can authorize
+  only one log entry. After restarting, interrupting a run, or changing the experiment
+  configuration, run the benchmark again before keeping a candidate.
 - `discard`, `crash`, and `checks_failed` revert experiment changes while retaining session files.
 - the finalize skill stashes and restores a dirty tree defensively before it creates review
   branches, and rolls created branches back on creation failure.
 
 Use an isolated Git worktree for unattended or high-risk optimization targets.
+
+The consecutive-failure guard stops auto-resume after more than 20 rejected results
+(`discard`, `crash`, or `checks_failed`) in the current segment. A kept result or a new
+segment resets the streak. Persisted JSONL recovery skips malformed outcomes, unknown
+statuses, invalid run numbers, and non-finite primary metrics; it never assumes an
+incomplete outcome was kept. Valid later lines remain recoverable.
 
 ## Checks and hooks
 
