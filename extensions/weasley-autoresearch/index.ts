@@ -53,6 +53,7 @@ import {
 import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
 import { captureCandidateProvenance, resolveBenchmarkPath } from "./provenance.ts";
+import { benchmarkPathFromCommand } from "./benchmark-command.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -372,35 +373,6 @@ function killTree(pid: number): void {
       // Process may have already exited
     }
   }
-}
-
-/**
- * Check if a command's primary purpose is running the benchmark script.
- *
- * Strategy: strip common harmless prefixes (env vars, env/time/nice wrappers)
- * then check that the core command is the benchmark script invoked via a known
- * pattern. Rejects chaining tricks like "evil.py; measure.sh" because we require
- * the benchmark script to be the *first* real command.
- */
-function benchmarkPathFromCommand(command: string): string | null {
-  let cmd = command.trim();
-
-  // Strip leading env variable assignments: FOO=bar BAZ="qux" ...
-  cmd = cmd.replace(/^(?:\w+=\S*\s+)+/, "");
-
-  // Strip known harmless command wrappers (env, time, nice, nohup) repeatedly
-  // Allows flags and their numeric values: e.g. "nice -n 10 time env ..."
-  let prev: string;
-  do {
-    prev = cmd;
-    cmd = cmd.replace(/^(?:env|time|nice|nohup)(?:\s+-\S+(?:\s+\d+)?)*\s+/, "");
-  } while (cmd !== prev);
-
-  // Now the core command must be the benchmark script via a known invocation.
-  // Current layout requires the `.auto/measure.sh` path; legacy `autoresearch.sh`
-  // is still accepted for in-flight sessions. An optional path prefix allows
-  //   ./.auto/measure.sh, /abs/path/.auto/measure.sh, bash [-flags] autoresearch.sh, etc.
-  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?((?:\/|\.{1,2}\/|[\w.-]+\/)*(?:autoresearch\.sh|\.auto\/measure\.sh))(?:\s|$)/.exec(cmd)?.[1] ?? null;
 }
 
 function isBetter(
@@ -1789,6 +1761,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
+      // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
+      // Every attempted run supersedes prior evidence, including a rejected
+      // invocation. Never let a validation failure revive an earlier success.
+      runtime.lastRunBenchmark = null;
+      runtime.lastRunChecks = null;
+      runtime.lastRunDuration = null;
+
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
       if (workDirError) {
@@ -1812,7 +1791,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
-      // Guard: if the benchmark script exists, only allow running it
+      // Guard: if the benchmark script exists, require a complete supported
+      // invocation, not merely a prefix whose shell status could hide failure.
       const autoresearchShPath = autoresearchScriptPath(workDir);
       const benchmarkScriptRel = path.relative(workDir, autoresearchShPath) || path.basename(autoresearchShPath);
       const benchmarkCommandPath = benchmarkPathFromCommand(params.command);
@@ -1820,7 +1800,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash ${benchmarkScriptRel}" }) or run_experiment({ command: "./${benchmarkScriptRel}" })`,
+            text: `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse a supported literal invocation such as run_experiment({ command: "bash ${benchmarkScriptRel}" }). Literal script arguments, quoted paths, and basic env/time/nice/nohup wrappers are supported. Put pipelines, redirection, chaining, expansion, or complex setup inside the benchmark script and propagate failures; syntax-only/help shell modes are not supported.`,
           }],
           details: {
             command: params.command,
@@ -1838,12 +1818,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
-      // Invalidate previous evidence before spawning: errors and aborts must not
-      // leave a prior successful benchmark available to log_experiment.
-      runtime.lastRunBenchmark = null;
-      runtime.lastRunChecks = null;
-      runtime.lastRunDuration = null;
       let candidateDigest: string;
       let invokedBenchmark: string | null;
       try {
