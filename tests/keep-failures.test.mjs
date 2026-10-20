@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import childProcess, { execFile } from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
@@ -32,6 +32,7 @@ async function fixture(t, failure) {
   let aborted = 0;
   let headReads = 0;
   let intercept;
+  let messageIntercept;
   let pauseFailure = false;
   let resumeFailure = false;
   let activeTools = [];
@@ -44,7 +45,10 @@ async function fixture(t, failure) {
       if (resumeFailure && data.active === true) throw new Error("injected resume record failure");
       entries.push({ type: "custom", customType, data });
     },
-    sendUserMessage: (...args) => messages.push(args),
+    sendUserMessage: (...args) => {
+      messages.push(args);
+      return messageIntercept?.(...args);
+    },
     getActiveTools: () => activeTools, setActiveTools: (next) => { activeTools = next; },
     async exec(command, args) {
       calls.push([command, ...args]);
@@ -96,6 +100,7 @@ async function fixture(t, failure) {
     activeTools: () => activeTools, aborted: () => aborted,
     setFailure: (next) => { failure = next; headReads = 0; },
     setIntercept: (next) => { intercept = next; },
+    setMessageIntercept: (next) => { messageIntercept = next; },
     failPause: () => { pauseFailure = true; },
     failResume: (value) => { resumeFailure = value; },
   };
@@ -173,6 +178,108 @@ test("changed and unchanged keeps use verified HEAD and publish one result each"
   const entries = (await readFile(join(h.cwd, ".auto/log.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
   assert.deepEqual(entries.filter((entry) => entry.status === "keep").map((entry) => entry.run), [1, 2]);
 });
+
+for (const failure of [
+  { stage: "after", kind: "invocation" },
+  { stage: "after", kind: "synchronous steering" },
+  { stage: "after", kind: "asynchronous steering" },
+  { stage: "before", kind: "synchronous steering" },
+  { stage: "before", kind: "asynchronous steering" },
+]) {
+  test(`unchanged keep remains recorded after ${failure.stage} hook ${failure.kind} fails`, async (t) => {
+    const h = await fixture(t);
+    // The shared fixture starts with a modified candidate. Restore it before
+    // benchmarking so this specifically exercises the no-new-commit path.
+    await writeFile(join(h.cwd, "candidate.txt"), "original\n");
+    const before = await h.head();
+    assert.equal((await exec("git", ["status", "--porcelain"], { cwd: h.cwd })).stdout, "");
+    await writeFile(join(h.cwd, ".auto/checks.sh"), "printf 'checks passed\\n'\n");
+    const benchmark = { command: "sleep 0.02; printf 'METRIC latency=1\\n'" };
+    const run = await h.call("run_experiment", benchmark);
+    assert.equal(run.details.exitCode, 0);
+    assert.equal(run.details.passed, true);
+    assert.equal(run.details.checksPass, true);
+    assert.ok(run.details.durationSeconds > 0, "use a real, timed passing benchmark");
+
+    await mkdir(join(h.cwd, ".auto/hooks"), { recursive: true });
+    const hookPath = join(h.cwd, `.auto/hooks/${failure.stage}.sh`);
+    const steering = `${failure.stage} hook steering`;
+    await writeFile(hookPath, `printf '${steering}\\n'\n`, { mode: 0o755 });
+    let injectedFailures = 0;
+    const message = `injected ${failure.stage} hook ${failure.kind} failure`;
+    if (failure.kind === "invocation") {
+      const originalSpawn = childProcess.spawn;
+      t.mock.method(childProcess, "spawn", (command, args, options) => {
+        if (command === "bash" && args?.length === 1 && args[0] === hookPath && options?.cwd === h.cwd) {
+          injectedFailures++;
+          throw new Error(message);
+        }
+        return originalSpawn(command, args, options);
+      });
+      syncBuiltinESMExports();
+      t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+    } else {
+      h.setMessageIntercept((value, options) => {
+        if (value !== steering || options?.deliverAs !== "steer") return;
+        injectedFailures++;
+        if (failure.kind === "asynchronous steering") return Promise.reject(new Error(message));
+        throw new Error(message);
+      });
+    }
+
+    const result = await h.call("log_experiment", keep);
+    assert.equal(injectedFailures, 1, "the intended post-publication failure must actually execute");
+    assert.notEqual(result.isError, true, "a follow-up failure cannot undo a recorded keep");
+    assert.equal(result.details.experiment.status, "keep");
+    assert.equal(result.details.experiment.commit, before.slice(0, 7));
+    assert.equal(result.details.state.results.length, 1);
+    assert.equal(result.details.wallClockSeconds, run.details.durationSeconds);
+    assert.match(text(result), /nothing to commit; using current HEAD/);
+    const warningLabel = `${failure.stage === "after" ? "After" : "Before"} hook${failure.kind === "invocation" ? "" : " steering"} failed:`;
+    assert.ok(text(result).includes(`⚠️ ${warningLabel} ${message}`), "report the specific failed follow-up as a warning");
+    assert.equal(await h.head(), before);
+    assert.equal(h.calls.some((args) => args[0] === "git" && args[1] === "commit"), false);
+    assert.equal(h.aborted(), 0, "a published keep does not require manual reconciliation");
+    assert.equal(h.activeTools().includes("log_experiment"), true);
+
+    const loggedKeeps = async () => (await readFile(join(h.cwd, ".auto/log.jsonl"), "utf8"))
+      .trim().split("\n").map(JSON.parse).filter((entry) => entry.status === "keep");
+    const recorded = await loggedKeeps();
+    assert.equal(recorded.length, 1, "exactly one keep is durable before any subsequent log call");
+    assert.equal(recorded[0].commit, before.slice(0, 7));
+    assert.equal(recorded[0].run, 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(result.details.state.results)), recorded.map(({ run: _run, ...entry }) => entry));
+
+    h.setMessageIntercept(undefined);
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    h.messages.length = 0;
+    // Standalone PR #6 permits another explicit keep without running a benchmark.
+    // It must not accidentally reuse the duration consumed by the recorded keep.
+    const repeated = await h.call("log_experiment", { ...keep, description: "explicit second keep" });
+    assert.equal(repeated.details.state.results.length, 2, "the first keep was published to runtime state once");
+    assert.equal(repeated.details.wallClockSeconds, null, "the failed hook must not leave stale benchmark duration");
+    assert.doesNotMatch(text(repeated), /hook(?: steering)? failed:/);
+    assert.equal(await h.head(), before);
+    assert.equal(h.calls.some((args) => args[0] === "git" && args[1] === "commit"), false);
+
+    await writeFile(join(h.cwd, "candidate.txt"), "next candidate\n");
+    const nextRun = await h.call("run_experiment", benchmark);
+    assert.equal(nextRun.details.passed, true);
+    assert.equal(nextRun.details.checksPass, true);
+    const next = await h.call("log_experiment", { ...keep, metric: 2, description: "fresh benchmark keep" });
+    assert.notEqual(next.isError, true);
+    assert.equal(next.details.state.results.length, 3);
+    assert.equal(next.details.wallClockSeconds, nextRun.details.durationSeconds);
+    assert.notEqual(await h.head(), before);
+    assert.equal(next.details.experiment.commit, (await h.head()).slice(0, 7));
+    assert.equal(h.calls.filter((args) => args[0] === "git" && args[1] === "commit").length, 1);
+    assert.doesNotMatch(text(next), /hook(?: steering)? failed:/);
+    assert.deepEqual((await loggedKeeps()).map((entry) => entry.run), [1, 2, 3]);
+    assert.ok(h.messages.some(([value, options]) => value === steering && options?.deliverAs === "steer"),
+      "the real hook and steering still work after removing the fault");
+  });
+}
 
 test("failed keeps do not count toward automatic continuation or fire success hooks", async (t) => {
   const h = await fixture(t, "diff");

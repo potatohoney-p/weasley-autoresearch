@@ -125,6 +125,10 @@ keeps publish their state before updating the dashboard and running hooks. The e
 activation record preserves a pause across same-session reloads when saving that record succeeds;
 failure to save the pause or abort the loop is reported explicitly.
 
+After publication, hook invocation or steering-delivery errors are reported as warnings alongside
+the recorded success, not as an uncertain keep. Per-run checks and timing are consumed before
+these follow-up actions. Do not repeat an already-recorded keep just because its hook failed.
+
 This is in-process outcome reporting, not an atomic Git/log transaction or a recovery journal.
 It does not lock other sessions or external writers, guarantee physical durability, or recover
 automatically after process death. A different session has no new persisted uncertainty marker.

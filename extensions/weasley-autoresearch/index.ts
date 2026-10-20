@@ -2554,6 +2554,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           Object.assign(runtime.state, state);
           runtime.experimentsThisSession++;
         }
+        // Consume per-run state at publication, before fallible hooks or UI work.
+        // A failure in those follow-up actions does not undo the recorded result.
+        const wallClockSeconds = runtime.lastRunDuration;
+        runtime.runningExperiment = null;
+        runtime.lastRunChecks = null;
+        runtime.lastRunDuration = null;
+
         try { broadcastDashboardUpdate(workDir); }
         catch (error) {
           text += `\n⚠️ Dashboard refresh failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -2572,18 +2579,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }
         }
 
-        const afterSteer = await fireHook({
+        const runPostLogHook = async (payload: HookPayload): Promise<void> => {
+          const label = payload.event === "after" ? "After" : "Before";
+          let steer: string | null;
+          try {
+            steer = await fireHook(payload);
+          } catch (error) {
+            text += `\n⚠️ ${label} hook failed: ${error instanceof Error ? error.message : String(error)}`;
+            return;
+          }
+          if (steer) {
+            try {
+              await pi.sendUserMessage(steer, { deliverAs: "steer" });
+            } catch (error) {
+              text += `\n⚠️ ${label} hook steering failed: ${error instanceof Error ? error.message : String(error)}`;
+            }
+          }
+        };
+
+        await runPostLogHook({
           event: "after",
           cwd: workDir,
           run_entry: jsonlEntry,
           session: buildSessionSnapshot(state),
         });
-        if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
-
-        const wallClockSeconds = runtime.lastRunDuration;
-        runtime.runningExperiment = null;
-        runtime.lastRunChecks = null;
-        runtime.lastRunDuration = null;
 
         const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
         if (limitReached) {
@@ -2592,14 +2611,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           setAutoresearchMode(ctx, false);
           ctx.abort();
         } else if (runtime.autoresearchMode) {
-          const beforeSteer = await fireHook({
+          await runPostLogHook({
             event: "before",
             cwd: workDir,
             next_run: state.results.length + 1,
             last_run: jsonlEntry,
             session: buildSessionSnapshot(state),
           });
-          if (beforeSteer) pi.sendUserMessage(beforeSteer, { deliverAs: "steer" });
         }
 
         updateWidget(ctx);
