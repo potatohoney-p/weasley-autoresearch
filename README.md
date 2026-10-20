@@ -111,6 +111,28 @@ Legacy flat `autoresearch.*` session files are read only for compatibility with 
 Malformed JSON, wrong types, invalid values, and unknown fields disable activation with an error.
 They are never treated as an empty/default config.
 
+## Structured metric output
+
+Emit one `METRIC name=value` record per line. Names accept ASCII word characters,
+dots and `µ`; `__proto__`, `constructor` and `prototype` are rejected. Values retain
+the existing finite JavaScript `Number` syntax, including decimal/scientific and
+hexadecimal/binary literals. Nonfinite values and malformed records are ignored;
+a record split across newlines is malformed. A final line need not end in a newline.
+
+Metrics are collected while output streams in, before the display tail is evicted.
+Each stdout/stderr pipe has its own UTF-8 decoder and line buffer. The last valid
+duplicate wins in observed line-completion order, including a final line completed
+by stream end. This does not establish a reliable chronology between the two pipes.
+Display truncation and full-output artifacts retain their existing behavior.
+
+Collection is bounded to 4096 decoded UTF-8 bytes per line, 128 characters per name,
+and the first 256 distinct valid names. Overlong lines are skipped until the next
+line boundary; additional names are ignored, while admitted names can still update.
+If a limit is reached, `run_experiment` reports `metricLimits` and a visible warning;
+some metrics, including the primary metric, may be missing. Inspect full output or
+emit shorter/fewer records and rerun. Limit warnings do not change benchmark success
+or failure, and failed benchmarks still return any metrics collected before exit.
+
 ## Git safety model
 
 Before both manual and persisted-session activation, the extension runs a read-only Git status
