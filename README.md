@@ -80,6 +80,12 @@ Set the shortcut to `null` to disable it.
 
 All current session artifacts live under `.auto/` in the effective working directory:
 
+On startup or session-tree navigation, a successfully read session log takes precedence over
+historical tool results, including an empty or config-only log. Clearing a session and initializing
+a new goal therefore does not restore the old goal or baseline before the first new result.
+Missing or unreadable logs retain the legacy history fallback; this does not validate or repair
+damaged logs.
+
 | File | Purpose |
 |---|---|
 | `.auto/prompt.md` | Goal, scope, metric, constraints, and accumulated guidance. |

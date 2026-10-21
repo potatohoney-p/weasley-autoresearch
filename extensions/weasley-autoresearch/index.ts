@@ -1409,8 +1409,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }));
         state.secondaryMetrics = reconstructed.secondaryMetrics.map((metric) => ({ ...metric }));
 
+        // A successfully read log is authoritative even before its first result.
+        // Falling back here would resurrect history from a cleared session.
+        loadedFromJsonl = true;
         if (state.results.length > 0) {
-          loadedFromJsonl = true;
           state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
           state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
         }
