@@ -1211,7 +1211,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   const reconciliationResult = () => ({
-    content: [{ type: "text" as const, text: "A previous keep has an uncertain Git or log outcome. Inspect HEAD, the index and the session log and reconcile them, then explicitly resume with /autoresearch <goal>. Automatic retries are blocked." }],
+    content: [{ type: "text" as const, text: "A previous experiment operation has an uncertain Git or log outcome. Inspect HEAD, the index and the session log and reconcile them, then explicitly resume with /autoresearch <goal>. Automatic retries are blocked." }],
     details: {},
     isError: true,
   });
@@ -1707,24 +1707,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const isReinit = state.results.length > 0;
-
-      state.name = params.name;
-      state.metricName = params.metric_name;
-      state.metricUnit = params.metric_unit ?? "";
-      if (params.direction === "lower" || params.direction === "higher") {
-        state.bestDirection = params.direction;
-      }
-      // Start a new segment — keep history for dashboard, but reset baseline tracking.
-      // Old results remain accessible (filtered by segment in rendering).
-      if (isReinit) {
-        state.currentSegment++;
-      }
-      state.bestMetric = null;
-      state.secondaryMetrics = [];
-      state.confidence = null;
-
-      // Read max experiments from config file (config always in ctx.cwd)
-      state.maxExperiments = readMaxExperiments(ctx.cwd);
+      // Keep the currently published goal/baseline intact until its replacement
+      // is persisted. A failed append may have written bytes, so it must pause
+      // through the same explicit reconciliation gate as an uncertain keep.
+      const nextState = {
+        ...state,
+        name: params.name,
+        metricName: params.metric_name,
+        metricUnit: params.metric_unit ?? "",
+        bestDirection: params.direction === "lower" || params.direction === "higher"
+          ? params.direction : state.bestDirection,
+        currentSegment: state.currentSegment + (isReinit ? 1 : 0),
+        bestMetric: null,
+        secondaryMetrics: [],
+        confidence: null,
+        maxExperiments: readMaxExperiments(ctx.cwd),
+      };
 
       // Write config header to jsonl (append for re-init, create for first)
       const workDir = resolveWorkDir(ctx.cwd);
@@ -1733,26 +1731,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ensureParentDir(jsonlPath);
         const config = JSON.stringify({
           type: "config",
-          name: state.name,
-          metricName: state.metricName,
-          metricUnit: state.metricUnit,
-          bestDirection: state.bestDirection,
+          name: nextState.name,
+          metricName: nextState.metricName,
+          metricUnit: nextState.metricUnit,
+          bestDirection: nextState.bestDirection,
         });
         if (fs.existsSync(jsonlPath)) {
           fs.appendFileSync(jsonlPath, config + "\n");
         } else {
           fs.writeFileSync(jsonlPath, config + "\n");
         }
-        broadcastDashboardUpdate(workDir);
       } catch (e) {
+        const pauseWarnings = pauseUncertainKeep(ctx, workDir);
         return {
           content: [{
             type: "text",
-            text: `⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`,
+            text: `❌ Experiment initialization persistence is uncertain: ${e instanceof Error ? e.message : String(e)}\nThe previous in-memory goal and baseline are unchanged. The config write may have partially or completely succeeded. Autoresearch is paused. Inspect and reconcile .auto/log.jsonl, then explicitly resume. Do not automatically retry initialization.${pauseWarnings}`,
           }],
-          details: {},
+          details: { state: cloneExperimentState(state) },
+          isError: true,
         };
       }
+
+      Object.assign(state, nextState);
+      broadcastDashboardUpdate(workDir);
 
       const wasInactive = !runtime.autoresearchMode;
       recordAutoresearchActivation(workDir, true);
