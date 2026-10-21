@@ -16,6 +16,8 @@ async function fixture(t) {
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   const git = args => execFileSync('git', args, { cwd, encoding: 'utf8' });
   git(['init', '--quiet']);
+  git(['config', 'user.name', 'Test']);
+  git(['config', 'user.email', 'test@example.invalid']);
   git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '--quiet', '-m', 'baseline']);
   const tools = new Map(), commands = new Map(), handlers = new Map(), entries = [];
   let active = [], aborted = 0;
