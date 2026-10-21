@@ -125,6 +125,14 @@ keeps publish their state before updating the dashboard and running hooks. The e
 activation record preserves a pause across same-session reloads when saving that record succeeds;
 failure to save the pause or abort the loop is reported explicitly.
 
+Initialization follows the same persistence-first rule: a new goal, metric, direction,
+segment, and reset baseline are published in memory only after its configuration header
+is written successfully. If that write throws, the old in-memory state remains intact,
+but the append may have written nothing, a partial header, or a complete header. The
+session pauses behind the same explicit reconciliation gate; inspect the active log
+before resuming, rather than retrying initialization and appending another header.
+This is not an atomic filesystem transaction or a cross-process recovery journal.
+
 After publication, hook invocation or steering-delivery errors are reported as warnings alongside
 the recorded success, not as an uncertain keep. Per-run checks and timing are consumed before
 these follow-up actions. Do not repeat an already-recorded keep just because its hook failed.
