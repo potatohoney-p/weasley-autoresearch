@@ -149,6 +149,8 @@ settling likewise cannot certify success. A fresh completed run can still be kep
 This ownership is local to each runtime: superseding does not itself stop older
 shell processes, serialize concurrent commands, or roll back their side effects.
 Existing abort and timeout handling still governs process termination.
+Log completion consumes only the evidence it accepted and reports that run's
+duration; delayed logging cannot clear evidence from a newer attempt.
 
 Supported forms retain literal script arguments and quoted/escaped paths:
 

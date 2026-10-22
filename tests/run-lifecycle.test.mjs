@@ -36,6 +36,7 @@ async function fixture(t, checks = "exit 0\n") {
   await writeFile(join(cwd, ".auto", "checks.sh"), checks);
   const tools = new Map(), handlers = new Map(), commands = new Map(), gitCalls = [], entries = [];
   const pendingChecks = [];
+  const pendingGit = [];
   let active = [];
   autoresearchExtension({
     on: (name, handler) => handlers.set(name, handler),
@@ -56,6 +57,13 @@ async function fixture(t, checks = "exit 0\n") {
           await hold.release.promise;
         }
       }
+      if (command === "git" && args[0] === "add") {
+        const hold = pendingGit.shift();
+        if (hold) {
+          hold.started.resolve();
+          await hold.release.promise;
+        }
+      }
       return result;
     },
   });
@@ -66,14 +74,44 @@ async function fixture(t, checks = "exit 0\n") {
   await command("start lifecycle test");
   await call("init_experiment", { name: "candidate", metric_name: "latency" });
   t.after(() => handlers.get("session_shutdown")({}, ctx));
-  const holdChecks = () => {
+  const holdCompletion = (queue) => {
     const hold = { started: deferred(), release: deferred() };
-    pendingChecks.push(hold);
+    queue.push(hold);
     t.after(() => hold.release.resolve());
     return hold;
   };
-  return { cwd, git, gitCalls, call, command, holdChecks, ctx, handlers,
+  return { cwd, git, gitCalls, call, command, ctx, handlers,
+    holdChecks: () => holdCompletion(pendingChecks), holdGit: () => holdCompletion(pendingGit),
     run: (suffix = "", signal) => call("run_experiment", { command: `bash .auto/measure.sh${suffix}` }, signal) };
+}
+
+for (const phase of ["pending", "completed"]) {
+  test(`an older log completion preserves a newer ${phase} run`, { timeout: 15000 }, async (t) => {
+    const h = await fixture(t);
+    const first = await h.run();
+    const logging = h.holdGit();
+    const log = h.call("log_experiment", keep);
+    await logging.started.promise;
+    const checks = h.holdChecks();
+    const latest = h.run().then((result) => ({ result }), (error) => ({ error }));
+    await checks.started.promise;
+    if (phase === "completed") {
+      checks.release.resolve();
+      assert.equal((await latest).result?.details.passed, true);
+    }
+    logging.release.resolve();
+    let recorded;
+    try { recorded = await log; }
+    finally { checks.release.resolve(); }
+    const current = await latest;
+    assert.equal(current.result?.details.passed, true, current.error?.message);
+    assert.equal(recorded.details.wallClockSeconds, first.details.durationSeconds);
+    const second = await h.call("log_experiment", keep);
+    assert.equal(second.details.experiment?.status, "keep", text(second));
+    assert.equal(second.details.state.results.length, 2);
+    assert.equal(second.details.wallClockSeconds, current.result.details.durationSeconds);
+    await assertKeepBlocked(h);
+  });
 }
 
 async function assertKeepBlocked(h) {
@@ -181,6 +219,24 @@ test("a consumed newer success cannot be resurrected by late passing checks", { 
   } finally { hold.release.resolve(); }
   await older;
   await assertKeepBlocked(h);
+});
+
+test("aborting a superseded call cannot revoke the latest passing evidence", { timeout: 15000 }, async (t) => {
+  const h = await fixture(t);
+  const hold = h.holdChecks();
+  const controller = new AbortController();
+  const older = h.run("", controller.signal).then((result) => ({ result }), (error) => ({ error }));
+  await hold.started.promise;
+  let current;
+  try {
+    current = await h.run();
+    controller.abort();
+  } finally { hold.release.resolve(); }
+  assert.match((await older).error?.message ?? "", /superseded/);
+  assert.equal(current.details.passed, true);
+  const logged = await h.call("log_experiment", keep);
+  assert.equal(logged.details.experiment?.status, "keep", text(logged));
+  assert.equal(logged.details.wallClockSeconds, current.details.durationSeconds);
 });
 
 test("superseded benchmarks cannot start correctness checks after finishing", { timeout: 15000 }, async (t) => {

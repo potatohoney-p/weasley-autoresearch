@@ -2426,6 +2426,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      // Capture the accepted run before Git and hooks can yield to a newer run.
+      const loggedGeneration = runtime.runGeneration;
+      const wallClockSeconds = runtime.lastRunDuration;
+
       // ASI: agent-supplied free-form diagnostics
       const mergedASI = (params.asi && Object.keys(params.asi).length > 0)
         ? params.asi as ASI
@@ -2613,8 +2617,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       });
       if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
 
-      const wallClockSeconds = runtime.lastRunDuration;
-      invalidateRunEvidence(runtime);
+      if (runtime.runGeneration === loggedGeneration) invalidateRunEvidence(runtime);
 
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
