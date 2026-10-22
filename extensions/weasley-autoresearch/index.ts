@@ -180,7 +180,9 @@ interface AutoresearchRuntime {
   autoresearchMode: boolean;
   experimentsThisSession: number;
   autoResumeTurns: number;
-  /** Only the latest completed benchmark in this runtime may authorize a keep. */
+  /** Revokes pending benchmark/check completions when evidence is invalidated. */
+  runGeneration: number;
+  /** Only the latest attempted run in this runtime may authorize a keep. */
   lastRunBenchmark: {
     passed: boolean;
     workDir: string;
@@ -777,6 +779,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     autoresearchMode: false,
     experimentsThisSession: 0,
     autoResumeTurns: 0,
+    runGeneration: 0,
     lastRunBenchmark: null,
     lastRunChecks: null,
     lastRunDuration: null,
@@ -785,6 +788,14 @@ function createSessionRuntime(): AutoresearchRuntime {
     pendingResumeTimer: null,
     pendingResumeMessage: null,
   };
+}
+
+function invalidateRunEvidence(runtime: AutoresearchRuntime): void {
+  runtime.runGeneration++;
+  runtime.lastRunBenchmark = null;
+  runtime.lastRunChecks = null;
+  runtime.lastRunDuration = null;
+  runtime.runningExperiment = null;
 }
 
 function createRuntimeStore() {
@@ -1354,10 +1365,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const reconstructState = (ctx: ExtensionContext) => {
     const runtime = getRuntime(ctx);
     cancelPendingResume(runtime);
-    runtime.lastRunBenchmark = null;
-    runtime.lastRunChecks = null;
-    runtime.lastRunDuration = null;
-    runtime.runningExperiment = null;
+    invalidateRunEvidence(runtime);
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
     runtime.state = createExperimentState();
@@ -1523,10 +1531,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_tree", async (_e, ctx) => reconstructState(ctx));
-  pi.on("session_before_switch", async () => {
+  pi.on("session_before_switch", async (_e, ctx) => {
+    invalidateRunEvidence(getRuntime(ctx));
     clearOverlay();
   });
   pi.on("session_shutdown", async (_e, ctx) => {
+    invalidateRunEvidence(getRuntime(ctx));
     clearSessionUi(ctx);
     cancelPendingResume(getRuntime(ctx));
     runtimeStore.clear(getSessionKey(ctx));
@@ -1648,9 +1658,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const isReinit = state.results.length > 0;
-      runtime.lastRunBenchmark = null;
-      runtime.lastRunChecks = null;
-      runtime.lastRunDuration = null;
+      invalidateRunEvidence(runtime);
 
       state.name = params.name;
       state.metricName = params.metric_name;
@@ -1764,9 +1772,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
       // Every attempted run supersedes prior evidence, including a rejected
       // invocation. Never let a validation failure revive an earlier success.
-      runtime.lastRunBenchmark = null;
-      runtime.lastRunChecks = null;
-      runtime.lastRunDuration = null;
+      invalidateRunEvidence(runtime);
+      const runGeneration = runtime.runGeneration;
+      const assertCurrentRun = () => {
+        if (runtime.runGeneration !== runGeneration) {
+          throw new Error("Experiment run superseded by another attempt or session change; its evidence was not published.");
+        }
+        if (signal?.aborted) {
+          invalidateRunEvidence(runtime);
+          throw new Error("aborted");
+        }
+      };
+      assertCurrentRun();
 
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
@@ -1994,13 +2011,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           });
         });
       }).finally(() => {
-        runtime.runningExperiment = null;
-        updateWidget(ctx);
-        if (overlayTui) overlayTui.requestRender();
+        if (runtime.runGeneration === runGeneration) {
+          runtime.runningExperiment = null;
+          updateWidget(ctx);
+          if (overlayTui) overlayTui.requestRender();
+        }
       });
 
+      assertCurrentRun();
       const durationSeconds = (Date.now() - t0) / 1000;
-      runtime.lastRunDuration = durationSeconds;
       const benchmarkPassed = exitCode === 0 && !timedOut;
 
       // Run backpressure checks if benchmark passed and checks file exists
@@ -2030,6 +2049,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      assertCurrentRun();
       // Snapshot work stays outside benchmark/check duration measurements.
       let provenanceError: string | null = null;
       if (benchmarkPassed && checksPass !== false) {
@@ -2041,10 +2061,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           provenanceError = `cannot verify candidate provenance: ${error instanceof Error ? error.message : String(error)}`;
         }
       }
-      // Store checks and candidate evidence for the pre-mutation keep gate.
-      runtime.lastRunBenchmark = { passed: benchmarkPassed, workDir, candidateDigest, invokedBenchmark, provenanceError };
-      runtime.lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
-
       const passed = benchmarkPassed && (checksPass === null || checksPass) && !provenanceError;
 
       // Reuse streaming temp file if it exists, otherwise create one for large output
@@ -2158,6 +2174,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
       }
 
+      // Publish only after the current call has finished preparing its result.
+      // Late completions must not revive evidence invalidated while awaiting.
+      assertCurrentRun();
+      runtime.lastRunBenchmark = { passed: benchmarkPassed, workDir, candidateDigest, invokedBenchmark, provenanceError };
+      runtime.lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
+      runtime.lastRunDuration = durationSeconds;
       return {
         content: [{ type: "text", text }],
         details: { ...details, truncation: llmTruncation.truncated ? llmTruncation : undefined, fullOutputPath },
@@ -2592,10 +2614,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
 
       const wallClockSeconds = runtime.lastRunDuration;
-      runtime.runningExperiment = null;
-      runtime.lastRunBenchmark = null;
-      runtime.lastRunChecks = null;
-      runtime.lastRunDuration = null;
+      invalidateRunEvidence(runtime);
 
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
@@ -3113,10 +3132,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         setAutoresearchMode(ctx, false);
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
-        runtime.lastRunBenchmark = null;
-        runtime.lastRunChecks = null;
-        runtime.lastRunDuration = null;
-        runtime.runningExperiment = null;
+        invalidateRunEvidence(runtime);
         cancelPendingResume(runtime);
         stopDashboardServer();
         clearSessionUi(ctx);
@@ -3145,10 +3161,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         setAutoresearchMode(ctx, false);
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
-        runtime.lastRunBenchmark = null;
-        runtime.lastRunChecks = null;
-        runtime.lastRunDuration = null;
-        runtime.runningExperiment = null;
+        invalidateRunEvidence(runtime);
         cancelPendingResume(runtime);
         runtime.state = createExperimentState();
         stopDashboardServer();

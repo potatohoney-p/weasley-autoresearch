@@ -141,6 +141,15 @@ For example, `bash -n .auto/measure.sh`, `bash .auto/measure.sh || true`, and
 Every attempted run clears earlier evidence, including a rejected invocation;
 run a fresh valid benchmark before keeping.
 
+Pending benchmark/check completions also lose permission to publish when a newer
+run is attempted, a result is consumed, or the session is reinitialized, stopped,
+cleared, reconstructed, switched, or shut down. Superseded calls reject instead of
+restoring old benchmark, checks, or timing evidence. An abort while checks are
+settling likewise cannot certify success. A fresh completed run can still be kept.
+This ownership is local to each runtime: superseding does not itself stop older
+shell processes, serialize concurrent commands, or roll back their side effects.
+Existing abort and timeout handling still governs process termination.
+
 Supported forms retain literal script arguments and quoted/escaped paths:
 
 - `bash .auto/measure.sh`, `sh .auto/measure.sh`, or `./.auto/measure.sh`.
