@@ -175,6 +175,15 @@ During an active clean session:
 - the finalize skill stashes and restores a dirty tree defensively before it creates review
   branches, and rolls created branches back on creation failure.
 
+A non-keep rollback stops at the first failing Git command. A nonzero exit, termination or
+execution error pauses the session and requires explicit reconciliation before resuming.
+The outcome is already recorded in memory and its log append has been attempted at that point;
+do not repeat `log_experiment`. Inspect HEAD, the index, working tree and `.auto/log.jsonl`,
+reconcile them, then explicitly resume with `/autoresearch <goal>`. Failed rollback does not
+run after/before hooks or claim that changes were reverted. Partial filesystem changes are
+not undone automatically. A zero exit still uses the existing checkout/clean semantics; this
+is not a transactional rollback or proof that staged/concurrent edits match HEAD.
+
 Use an isolated Git worktree for unattended or high-risk optimization targets.
 
 ## Checks and hooks

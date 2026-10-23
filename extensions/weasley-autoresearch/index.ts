@@ -2571,13 +2571,28 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (params.status !== "keep") {
           try {
             const revertScript = `
+              set -e
               git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
-              git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
+              git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**'
             `;
-            await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
+            const rollback = await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
+            if (rollback.code !== 0 || rollback.killed) {
+              throw new Error(`exit ${rollback.code}${rollback.killed ? ", terminated" : ""}: ${(rollback.stderr || rollback.stdout || "no diagnostic output").slice(0, 500)}`);
+            }
             text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
           } catch (e) {
-            text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+            const pauseWarnings = pauseUncertainKeep(ctx, workDir);
+            text += `\n❌ Git rollback did not complete: ${e instanceof Error ? e.message : String(e)}\nThe experiment outcome has already been recorded in memory and its log append was attempted. Do not repeat log_experiment. Autoresearch is paused. Inspect HEAD, the index, working tree and session log, reconcile them, then explicitly resume.${pauseWarnings}`;
+            return {
+              content: [{ type: "text", text }],
+              details: {
+                experiment: { ...experiment, metrics: { ...experiment.metrics } },
+                state: cloneExperimentState(state),
+                wallClockSeconds,
+                rollbackOutcome: { ok: false, uncertain: true },
+              },
+              isError: true,
+            };
           }
         }
 
@@ -2655,7 +2670,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     renderResult(result, _options, theme) {
       const d = result.details as LogDetails | undefined;
-      if (!d?.experiment || !d.state) {
+      if (result.isError || !d?.experiment || !d.state) {
         const t = result.content[0];
         return new Text(t?.type === "text" ? t.text : "", 0, 0);
       }
