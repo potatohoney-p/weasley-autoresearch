@@ -20,6 +20,8 @@ reverts regressions while preserving an auditable session log. The published pac
   activation before any later `git add -A`, checkout, or clean operation can touch them.
 - Strict configuration parsing: malformed or unknown settings fail closed instead of silently
   falling back to a different directory or iteration policy.
+- Local repeated-benchmark runner with separate warmups, median metrics, and optional per-trial
+  JSON evidence. Failed or incomplete series never emit aggregate metrics.
 
 ## Requirements
 
@@ -142,6 +144,66 @@ Optional `.auto/hooks/before.sh` and `.auto/hooks/after.sh` receive a JSON paylo
 stdout is delivered to the agent as bounded steering context. Non-zero exits and timeouts are
 reported and logged rather than hidden. Examples live in
 [`skills/autoresearch-hooks/examples/`](skills/autoresearch-hooks/examples).
+
+## Repeated measurements
+
+For noisy workloads, `weasley-benchmark` runs the same local command serially and emits the median
+of every reported metric. Install the package in the target project to expose the CLI:
+
+```bash
+npm install --save-dev weasley-autoresearch
+./node_modules/.bin/weasley-benchmark --metric runtime_ms --runs 5 --warmup 1 \
+  --report .auto/trials-001.json -- node benchmarks/workload.mjs
+```
+
+Create `.auto/` first and choose a new report filename for each experiment. To use the existing
+experiment loop, put that command in `.auto/measure.sh` with `set -euo pipefail`. The workload
+should emit `METRIC runtime_ms=number` on stdout, plus any secondary metrics. `run_experiment`
+then parses the aggregate output normally and runs `.auto/checks.sh` once after the complete
+series succeeds. Use those parsed values in `log_experiment`; record the report path in `asi`
+if useful. No new log schema or keep/discard policy is introduced.
+
+The CLI is also runnable from a source checkout with `node bin/repeat-benchmark.mjs`. It needs
+only Node, not a model provider or the Pi runtime, and performs no network requests itself.
+
+### Trial contract
+
+- `--metric NAME` identifies the required primary metric. `--runs` defaults to 5 (range 1–100);
+  `--warmup` defaults to 0 (range 0–20). Warmups must exit successfully but need not emit metrics.
+- Measured trials must exit zero and emit the same set of metric names. Each name must occur
+  exactly once per trial, be at most 128 characters, and contain only letters/digits/underscore,
+  dot or `µ`. At most 256 names are allowed. Values must be finite decimal numbers; scientific
+  notation is supported. Missing, duplicate, malformed and non-finite records fail the series.
+- Only stdout supplies metrics; stderr is diagnostic output. Non-metric output is not forwarded
+  or saved. Each trial is limited to 1 MiB of combined stdout/stderr. `--timeout-seconds` defaults
+  to 60 per trial (range 0.001–86400), including warmups. Set the outer `run_experiment` timeout
+  high enough for the whole series plus process-cleanup time.
+- The first failed trial stops the series. No successful subset is aggregated. A requested JSON
+  report includes every attempted trial, its phase, exit/signal/error, duration and measured
+  metrics, plus requested and completed counts. Unattempted trials remain visible in the plan's
+  denominator. Failed series have `summary: null` and exit 1; invalid arguments exit 2.
+- A successful report includes count, median, minimum, maximum and median absolute deviation
+  (MAD) for each metric. An unrepresentable MAD is `null`, not Infinity. Warmups are excluded.
+  Stdout contains only aggregate `METRIC name=median` lines for successful series.
+- `--report FILE` is optional and never overwrites an existing destination. Its parent directory
+  must exist. Report-write failure prevents aggregate output and exits nonzero. Ordinary
+  SIGINT/SIGTERM interruption attempts to save a failed report; abrupt process/OS failure can
+  leave no report or an incomplete file. Writes are not a durable transaction.
+
+Commands are executed as literal executable/argument lists after `--`, without shell expansion.
+Use `-- bash script.sh` when a script needs Bash. They inherit the working directory, environment
+and user permissions: this is not a sandbox. Timeouts/interruption terminate the POSIX process
+group on a best-effort basis, escalating after a 250 ms grace period; on Windows only the direct
+child is terminated. The runner closes its own pipes after that grace period rather than waiting
+indefinitely for an escaped descendant. A program can escape process-group cleanup and continue
+running, so use trusted workloads and an isolated worktree where appropriate.
+
+Reports record the command, cwd, Node version, platform and architecture, but not environment
+variables or raw stdout/stderr. Command arguments and paths may still be sensitive; inspect a
+report before sharing it. Keep reports under `.auto/` (or ignored paths) so they do not contaminate
+candidate provenance. This captures observations, not an exact environment/input snapshot or
+proof of reproducibility. Serial trials are not guaranteed independent, and median/MAD are
+descriptive statistics, not a confidence interval or significance test.
 
 ## Testing
 

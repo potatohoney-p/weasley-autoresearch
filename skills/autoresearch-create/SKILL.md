@@ -74,7 +74,31 @@ Update `.auto/prompt.md` periodically — especially the "What's Been Tried" sec
 
 Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), runs the benchmark, and outputs structured lines to stdout. Keep the script fast — every second is multiplied by hundreds of runs.
 
-**For fast, noisy benchmarks** (< 5s), run the workload multiple times inside the script and report the median. This produces stable data points and makes the confidence score reliable from the start. Slow workloads (ML training, large builds) don't need this — single runs are fine.
+**For fast, noisy benchmarks** (< 5s), run the workload multiple times inside the script and report the median. Repeated observations help characterize noise; the session confidence score remains advisory. For expensive workloads (ML training, large builds), balance repeat count against the cost and the uncertainty you need to assess.
+
+The package's optional `weasley-benchmark` CLI handles repeated measurements without a custom
+aggregation script. With a project-local install, `.auto/measure.sh` can contain:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+report=".auto/trials-$(date +%s)-$$.json"
+./node_modules/.bin/weasley-benchmark --metric runtime_ms --runs 5 --warmup 1 \
+  --report "$report" -- node benchmarks/workload.mjs
+```
+
+The workload emits one `METRIC name=number` per metric on stdout. The runner emits median
+`METRIC` lines only after all measured trials succeed with identical metric-name sets. Missing,
+duplicate or non-finite metrics, nonzero exits, timeouts and output-limit failures stop the series
+without an aggregate. Warmups are separate and excluded. Reports preserve requested/completed
+counts and every attempted trial, including failures; use a new filename on each invocation and
+keep it under `.auto/`. Record the report path in `asi` when logging the result. Allow enough time
+in `run_experiment` for every trial, and do not swallow the runner's nonzero exit.
+
+This helper executes literal argv with inherited permissions/environment and no shell by default.
+It is not a sandbox, an environment snapshot, or evidence that repeated observations are
+statistically independent. Median/MAD are descriptive, not a significance test. See README's
+"Repeated measurements" for bounds, cleanup limits and report semantics.
 
 #### Structured output
 
