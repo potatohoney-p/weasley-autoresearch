@@ -455,3 +455,78 @@ test("pending log rejects other statuses, init, run, clear and restart while off
   assert.equal((await first).details.state.results.length, 1);
   assert.equal((await h.call("log_experiment", keep)).details.state.results.length, 2, "busy lock is released");
 });
+
+for (const status of ["discard", "crash", "checks_failed"]) {
+  test(`${status} pauses after real checkout failure without cleaning or claiming rollback`, async (t) => {
+    const h = await fixture(t);
+    await writeFile(join(h.cwd, "untracked.txt"), "must survive failed checkout\n");
+    await writeFile(join(h.cwd, ".git", "index.lock"), "test lock\n");
+    const result = await h.call("log_experiment", { ...keep, status });
+    assert.equal(result.isError, true);
+    assert.doesNotMatch(text(result), /Git: reverted changes/);
+    assert.equal(await readFile(join(h.cwd, "candidate.txt"), "utf8"), "candidate\n");
+    assert.equal(await readFile(join(h.cwd, "untracked.txt"), "utf8"), "must survive failed checkout\n");
+    assert.equal(h.aborted(), 1);
+    const logBefore = await readFile(join(h.cwd, ".auto", "log.jsonl"), "utf8");
+    assert.equal(logBefore.split('\n').filter(line => line && JSON.parse(line).status === status).length, 1);
+    assert.equal((await h.call("log_experiment", { ...keep, status })).isError, true);
+    assert.equal(await readFile(join(h.cwd, ".auto", "log.jsonl"), "utf8"), logBefore);
+  });
+}
+
+for (const failure of ["exit", "killed", "throw"]) {
+  test(`rollback ${failure} stops continuation while retaining the recorded outcome`, async (t) => {
+    const h = await fixture(t);
+    h.setIntercept((command, args) => {
+      if (command !== "bash" || !args[1]?.includes("git checkout")) return;
+      if (failure === "throw") throw new Error("rollback transport failure");
+      return { code: failure === "exit" ? 1 : 0, killed: failure === "killed", stdout: "", stderr: "rollback failed" };
+    });
+    const result = await h.call("log_experiment", { ...keep, status: "discard" });
+    assert.equal(result.isError, true);
+    assert.doesNotMatch(text(result), /Git: reverted changes/);
+    assert.equal(result.details.experiment.status, "discard");
+    assert.equal(result.details.state.results.length, 1);
+    assert.equal(result.details.rollbackOutcome.ok, false);
+    const rendered = h.tools.get("log_experiment").renderResult(result, { expanded: false, isPartial: false }, { fg: (_color, value) => value, bold: (value) => value }).render(120).join("\n");
+    assert.match(rendered, /Git rollback did not complete/);
+    assert.match(rendered, /Do not repeat\s+log_experiment/);
+    assert.equal(h.aborted(), 1);
+    const callsBefore = h.calls.length;
+    assert.equal((await h.call("run_experiment", { command: "echo no" })).isError, true);
+    assert.equal((await h.call("init_experiment", { name: "no", metric_name: "latency" })).isError, true);
+    assert.equal(h.calls.length, callsBefore);
+  });
+}
+
+test("successful rollback preserves session files and does not pause", async (t) => {
+  const h = await fixture(t);
+  await writeFile(join(h.cwd, "untracked.txt"), "experiment\n");
+  await writeFile(join(h.cwd, ".auto", "ideas.md"), "retained\n");
+  const result = await h.call("log_experiment", { ...keep, status: "discard" });
+  assert.notEqual(result.isError, true);
+  assert.match(text(result), /Git: reverted changes/);
+  assert.equal(await readFile(join(h.cwd, "candidate.txt"), "utf8"), "original\n");
+  assert.equal(fs.existsSync(join(h.cwd, "untracked.txt")), false);
+  assert.equal(await readFile(join(h.cwd, ".auto", "ideas.md"), "utf8"), "retained\n");
+  assert.equal(h.aborted(), 0);
+});
+
+test("partial rollback pauses despite pause callback failures and never calls after hooks", async (t) => {
+  const h = await fixture(t);
+  await mkdir(join(h.cwd, ".auto", "hooks"));
+  await writeFile(join(h.cwd, ".auto", "hooks", "after.sh"), "#!/bin/sh\necho hook-ran > hook-marker\n", { mode: 0o755 });
+  h.setIntercept(async (command, args) => {
+    if (command !== "bash" || !args[1]?.includes("git checkout")) return;
+    await exec("git", ["checkout", "--", "candidate.txt"], { cwd: h.cwd });
+    return { code: 1, stdout: "", stderr: "injected clean failure after checkout" };
+  });
+  h.failPause();
+  const result = await h.call("log_experiment", { ...keep, status: "discard" });
+  assert.equal(result.isError, true);
+  assert.match(text(result), /Could not persist session pause/);
+  assert.match(text(result), /Could not abort current loop/);
+  assert.equal(await readFile(join(h.cwd, "candidate.txt"), "utf8"), "original\n");
+  assert.equal(fs.existsSync(join(h.cwd, "hook-marker")), false);
+  assert.equal((await h.call("log_experiment", keep)).isError, true);
+});
