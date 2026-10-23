@@ -276,3 +276,70 @@ for (const newer of ["failed", "rejected"]) {
     assert.equal((await h.call("log_experiment", keep)).details.state.results.length, 1);
   });
 }
+
+for (const observed of [0, -5, 1.25e-12]) {
+  test(`keep rejects a primary metric inconsistent with observed ${observed}`, async (t) => {
+    const h = await fixture(t);
+    await writeFile(join(h.cwd, '.auto', 'measure.sh'), `printf 'METRIC latency=${observed}\\n'\n`);
+    const measured = await h.run();
+    assert.equal(measured.details.parsedPrimary, observed);
+    const logPath = join(h.cwd, '.auto', 'log.jsonl');
+    const before = await readFile(logPath);
+    const head = (await h.git(['rev-parse', 'HEAD'])).stdout;
+    const calls = h.gitCalls.length;
+    const rejected = await h.call('log_experiment', { ...keep, metric: observed + 10, force: true });
+    assert.equal(rejected.details.experiment, undefined, 'a mismatched value must not be persisted');
+    assert.match(text(rejected), /primary metric.*match/i);
+    assert.deepEqual(await readFile(logPath), before);
+    assert.equal(h.gitCalls.length, calls);
+    assert.equal((await h.git(['rev-parse', 'HEAD'])).stdout, head);
+    // Correcting a transcription error must not require another benchmark.
+    const corrected = await h.call('log_experiment', { ...keep, metric: observed });
+    assert.equal(corrected.details.experiment?.metric, observed, text(corrected));
+    assert.equal(corrected.details.state.results.length, 1);
+  });
+}
+
+test('mutating returned metric details cannot rewrite observed keep evidence', async (t) => {
+  const h = await fixture(t);
+  const measured = await h.run();
+  measured.details.parsedPrimary = 9;
+  measured.details.parsedMetrics.latency = 9;
+  const rejected = await h.call('log_experiment', { ...keep, metric: 9 });
+  assert.equal(rejected.details.experiment, undefined);
+  assert.equal((await h.call('log_experiment', keep)).details.experiment?.metric, 1);
+});
+
+test('manual metric workflows remain supported when no primary METRIC was observed', async (t) => {
+  const h = await fixture(t);
+  await writeFile(join(h.cwd, '.auto', 'measure.sh'), "printf 'duration: 7\\nMETRIC secondary=3\\n'\n");
+  const measured = await h.run();
+  assert.equal(measured.details.parsedPrimary, null);
+  const logged = await h.call('log_experiment', { ...keep, metric: 7 });
+  assert.equal(logged.details.experiment?.metric, 7, text(logged));
+});
+
+for (const next of [2, null]) {
+  test(`a fresh run replaces the prior observed primary with ${next}`, async (t) => {
+    const h = await fixture(t);
+    await h.run();
+    await writeFile(join(h.cwd, '.auto', 'measure.sh'), next === null ? 'exit 0\n' : `printf 'METRIC latency=${next}\\n'\n`);
+    const current = await h.run();
+    assert.equal(current.details.parsedPrimary, next);
+    if (next !== null) {
+      assert.equal((await h.call('log_experiment', keep)).details.experiment, undefined);
+    }
+    const logged = await h.call('log_experiment', { ...keep, metric: next ?? 7 });
+    assert.equal(logged.details.experiment?.metric, next ?? 7, text(logged));
+  });
+}
+
+for (const status of ['discard', 'crash', 'checks_failed']) {
+  test(`primary consistency guard does not block ${status} evidence`, async (t) => {
+    const h = await fixture(t);
+    await h.run();
+    const logged = await h.call('log_experiment', { ...keep, status, metric: 0 });
+    assert.equal(logged.details.experiment?.status, status, text(logged));
+    assert.equal(logged.details.experiment?.metric, 0);
+  });
+}
