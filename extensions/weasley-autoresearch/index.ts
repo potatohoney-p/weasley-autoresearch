@@ -185,6 +185,8 @@ interface AutoresearchRuntime {
   /** Only the latest attempted run in this runtime may authorize a keep. */
   lastRunBenchmark: {
     passed: boolean;
+    /** Observed primary value, copied independently of returned tool details. */
+    primaryMetric: number | null;
     workDir: string;
     candidateDigest: string;
     invokedBenchmark: string | null;
@@ -2177,7 +2179,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Publish only after the current call has finished preparing its result.
       // Late completions must not revive evidence invalidated while awaiting.
       assertCurrentRun();
-      runtime.lastRunBenchmark = { passed: benchmarkPassed, workDir, candidateDigest, invokedBenchmark, provenanceError };
+      runtime.lastRunBenchmark = { passed: benchmarkPassed, primaryMetric: parsedPrimary, workDir, candidateDigest, invokedBenchmark, provenanceError };
       runtime.lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
       runtime.lastRunDuration = durationSeconds;
       return {
@@ -2358,6 +2360,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (params.status === "keep" && !runtime.lastRunBenchmark?.passed) {
         return {
           content: [{ type: "text", text: "❌ Cannot keep — the latest benchmark failed or timed out. Log as 'crash' or run a successful benchmark first." }],
+          details: {},
+        };
+      }
+
+      // A caller may transcribe a manual metric only when the run did not
+      // observe the primary METRIC. Never publish a conflicting measured value.
+      const observedPrimary = runtime.lastRunBenchmark?.primaryMetric;
+      if (params.status === "keep" && observedPrimary != null && params.metric !== observedPrimary) {
+        return {
+          content: [{ type: "text", text: `❌ Cannot keep — primary metric must match the latest observed value (${observedPrimary}). Correct metric to that value or rerun the benchmark; force does not override measurement evidence.` }],
           details: {},
         };
       }

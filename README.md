@@ -152,6 +152,13 @@ Existing abort and timeout handling still governs process termination.
 Log completion consumes only the evidence it accepted and reports that run's
 duration; delayed logging cannot clear evidence from a newer attempt.
 
+If that run parsed the configured primary `METRIC`, a `keep` must supply exactly
+that numeric value. A transcription mismatch is rejected before Git, hooks, or
+result publication, even with `force: true`. Correcting the value can reuse the
+same unconsumed run. When no primary metric was parsed, manual metrics remain
+supported. This guard does not certify unparsed output, secondary metrics, or
+benchmark methodology; it does not change the parser's existing output limits.
+
 Supported forms retain literal script arguments and quoted/escaped paths:
 
 - `bash .auto/measure.sh`, `sh .auto/measure.sh`, or `./.auto/measure.sh`.
