@@ -139,7 +139,10 @@ npm run lint
 ```
 
 Optional `.auto/hooks/before.sh` and `.auto/hooks/after.sh` receive a JSON payload on stdin. Their
-stdout is delivered to the agent as bounded steering context. Non-zero exits and timeouts are
+stdout is delivered to the agent as bounded steering context. Each hook stream retains at most
+8 KiB of output bytes plus a truncation marker, including stderr from failed hooks. UTF-8
+characters split across output chunks are preserved; a character cut by the byte cap is omitted.
+This bounds retained output, not the hook process itself or its total emitted data. Non-zero exits and timeouts are
 reported and logged rather than hidden. Examples live in
 [`skills/autoresearch-hooks/examples/`](skills/autoresearch-hooks/examples).
 

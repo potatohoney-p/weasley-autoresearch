@@ -1,26 +1,34 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 
 import { hasAutoresearchConfigHeader } from "./jsonl.ts";
 import { hookScriptPath } from "./paths.ts";
 
 const TIMEOUT_MS = 30_000;
-const STDOUT_MAX_BYTES = 8 * 1024;
-const TRUNCATION_MARKER = "\n…[truncated: hook stdout exceeded 8KB]";
+const OUTPUT_MAX_BYTES = 8 * 1024;
 
-const NEWLINE = 0x0a;
-const UTF8_CONT_MASK = 0xc0;
-const UTF8_CONT = 0x80; // continuation byte: 10xxxxxx
-const UTF8_LEAD = 0xc0; // multi-byte leader: 11xxxxxx
-
-/** Trim at the last newline, falling back to the last complete UTF-8 character. */
-function truncateAtBoundary(buf: Buffer): Buffer {
-  const newlineEnd = buf.lastIndexOf(NEWLINE);
-  if (newlineEnd >= 0) return buf.subarray(0, newlineEnd + 1);
-  let end = buf.length;
-  while (end > 0 && (buf[end - 1] & UTF8_CONT_MASK) === UTF8_CONT) end--;
-  if (end > 0 && (buf[end - 1] & UTF8_CONT_MASK) === UTF8_LEAD) end--;
-  return buf.subarray(0, end);
+/** Retain a bounded byte prefix; decoding after collection preserves split UTF-8. */
+export function createHookOutputCollector(stream: "stdout" | "stderr") {
+  const buffer = Buffer.alloc(OUTPUT_MAX_BYTES);
+  let length = 0;
+  let truncated = false;
+  return {
+    append(chunk: Buffer) {
+      const kept = Math.min(chunk.length, OUTPUT_MAX_BYTES - length);
+      chunk.copy(buffer, length, 0, kept);
+      length += kept;
+      if (kept < chunk.length) truncated = true;
+    },
+    text(): string {
+      const bytes = buffer.subarray(0, length);
+      if (!truncated) return bytes.toString("utf8");
+      // An incomplete final code point at the byte cap must not become U+FFFD.
+      const decoder = new StringDecoder("utf8");
+      const prefix = decoder.write(bytes);
+      return prefix + `\n…[truncated: hook ${stream} exceeded 8KB]`;
+    },
+  };
 }
 
 export type HookStage = "before" | "after";
@@ -87,34 +95,17 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
   return new Promise<HookResult>((resolve) => {
     const child = spawn("bash", [script], { cwd: payload.cwd, timeout: TIMEOUT_MS });
 
-    let stdout = "";
-    let stdoutBytes = 0;
-    let stdoutFull = false;
-    let stderr = "";
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (stdoutFull) return;
-      const remaining = STDOUT_MAX_BYTES - stdoutBytes;
-      if (chunk.length <= remaining) {
-        stdout += chunk.toString("utf8");
-        stdoutBytes += chunk.length;
-        return;
-      }
-      const kept = truncateAtBoundary(chunk.subarray(0, remaining));
-      stdout += kept.toString("utf8") + TRUNCATION_MARKER;
-      stdoutFull = true;
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
+    const stdout = createHookOutputCollector("stdout");
+    const stderr = createHookOutputCollector("stderr");
+    child.stdout.on("data", (chunk: Buffer) => stdout.append(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
 
     const finish = (exitCode: number | null, extraErr = "") => {
-      const combinedStderr = extraErr ? (stderr ? `${stderr}\n${extraErr}` : extraErr) : stderr;
+      if (extraErr) stderr.append(Buffer.from(`\n${extraErr}`, "utf8"));
       resolve({
         fired: true,
-        stdout,
-        stderr: combinedStderr,
+        stdout: stdout.text(),
+        stderr: stderr.text(),
         exitCode,
         timedOut: child.killed,
         durationMs: Date.now() - t0,
