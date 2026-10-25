@@ -58,6 +58,7 @@ export interface HookResult {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
+  stdinError?: string;
   durationMs: number;
 }
 
@@ -91,6 +92,11 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
     let stdoutBytes = 0;
     let stdoutFull = false;
     let stderr = "";
+    let stdinError: string | undefined;
+
+    // A hook may close stdin before a large snapshot has finished writing.
+    // Observe delivery failures without killing the host or hiding the child exit.
+    child.stdin.on("error", (err) => { stdinError = err.message; });
 
     child.stdout.on("data", (chunk: Buffer) => {
       if (stdoutFull) return;
@@ -116,6 +122,7 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
         stdout,
         stderr: combinedStderr,
         exitCode,
+        ...(stdinError ? { stdinError } : {}),
         timedOut: child.killed,
         durationMs: Date.now() - t0,
       });
@@ -131,9 +138,16 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
 
 export function steerMessageFor(stage: HookStage, result: HookResult): string | null {
   if (!result.fired) return null;
-  if (result.timedOut) return `[${stage} hook timed out after ${TIMEOUT_MS / 1000}s]`;
-  if (result.exitCode !== 0) {
-    const parts = [`[${stage} hook exited ${result.exitCode}]`];
+  if (result.timedOut) {
+    const timeout = `[${stage} hook timed out after ${TIMEOUT_MS / 1000}s]`;
+    return result.stdinError
+      ? `${timeout}\n[${stage} hook input delivery failed: ${result.stdinError}]`
+      : timeout;
+  }
+  if (result.stdinError || result.exitCode !== 0) {
+    const parts = [result.stdinError
+      ? `[${stage} hook input delivery failed: ${result.stdinError}; exited ${result.exitCode}]`
+      : `[${stage} hook exited ${result.exitCode}]`];
     const err = result.stderr.trim();
     const out = result.stdout.trim();
     if (err) parts.push(err);
@@ -151,6 +165,7 @@ export function hookLogEntry(stage: HookStage, result: HookResult): Record<strin
     duration_ms: result.durationMs,
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
     timed_out: result.timedOut,
+    ...(result.stdinError ? { stdin_error: result.stdinError } : {}),
   };
 }
 

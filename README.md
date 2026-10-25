@@ -140,7 +140,10 @@ npm run lint
 
 Optional `.auto/hooks/before.sh` and `.auto/hooks/after.sh` receive a JSON payload on stdin. Their
 stdout is delivered to the agent as bounded steering context. Non-zero exits and timeouts are
-reported and logged rather than hidden. Examples live in
+reported and logged rather than hidden. A hook that closes stdin early cannot crash the host with
+a broken-pipe error: detected input-delivery failures are reported in steering context and recorded
+as `stdin_error`, separately from the actual child exit code. Successful writes only confirm pipe
+delivery, not that the hook parsed or acted on the entire JSON payload. Examples live in
 [`skills/autoresearch-hooks/examples/`](skills/autoresearch-hooks/examples).
 
 ## Testing
