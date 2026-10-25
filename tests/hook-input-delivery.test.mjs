@@ -68,6 +68,9 @@ test('fully consumed large payload retains successful hook behavior', async () =
 
 test('spawn failure remains a handled result even with queued stdin', async () => {
   const { result, message } = await invoke('#!/bin/bash\nexit 0\n', 'before', {
+    // Node 24.21 retains spawn's native 30s timer on ENOENT (fixed in 24.22).
+    // Keep the real handled-result assertions without mistaking that timer for a crash.
+    timeout: 40000,
     env: { ...process.env, PATH: '/nonexistent-hook-test-path' }
   });
   assert.equal(result.exitCode, null);
