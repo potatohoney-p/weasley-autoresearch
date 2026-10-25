@@ -13,7 +13,7 @@ reverts regressions while preserving an auditable session log. The published pac
 - Live terminal widget, fullscreen dashboard, confidence scoring, and JSONL session history.
 - Correctness backpressure through optional `.auto/checks.sh`.
 - Before/after hooks for research context, notifications, and learning journals.
-- Automatic continuation across agent turns and context compaction, with bounded safety guards.
+- Automatic continuation across agent turns and context compaction, with bounded safety guards. Compaction summaries preserve finite benchmark metric values without rounding away small differences; percentage deltas remain rounded display hints.
 - Optional redirected working directories for isolated worktrees.
 - Finalization skill that groups experiment commits into independent review branches.
 - Clean-worktree activation guard: existing staged, tracked, and untracked user changes stop

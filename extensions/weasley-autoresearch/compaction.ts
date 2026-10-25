@@ -206,8 +206,9 @@ const STATUS_WIDTH = "checks_failed".length;
 
 function formatMetric(value: number): string {
   if (!Number.isFinite(value)) return "—";
-  if (Number.isInteger(value)) return String(value);
-  return value.toFixed(2);
+  // The summary replaces conversation history, so preserve the persisted
+  // number rather than rounding distinct measurements to the same value.
+  return String(value);
 }
 
 function formatDelta(value: number, baseline: number | null): string {
