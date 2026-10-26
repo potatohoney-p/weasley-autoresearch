@@ -679,6 +679,11 @@ function findBaselineRunNumber(results: ExperimentResult[], segment: number): nu
   return index >= 0 ? index + 1 : null;
 }
 
+/** Metric names are user data, including names inherited from Object.prototype. */
+function ownMetric(metrics: Record<string, number>, name: string): number | undefined {
+  return Object.hasOwn(metrics, name) ? metrics[name] : undefined;
+}
+
 /**
  * Find secondary metric baselines from the first experiment in current segment.
  * For metrics that didn't exist at baseline time, falls back to the first
@@ -697,11 +702,13 @@ function findBaselineSecondary(
   // Fill in any known metrics missing from baseline with their first occurrence
   if (knownMetrics) {
     for (const sm of knownMetrics) {
-      if (base[sm.name] === undefined) {
+      if (ownMetric(base, sm.name) === undefined) {
         for (const r of cur) {
-          const val = (r.metrics ?? {})[sm.name];
+          const val = ownMetric(r.metrics ?? {}, sm.name);
           if (val !== undefined) {
-            base[sm.name] = val;
+            Object.defineProperty(base, sm.name, {
+              value: val, enumerable: true, writable: true, configurable: true,
+            });
             break;
           }
         }
@@ -923,8 +930,8 @@ function renderDashboardLines(
       // Build individually-colored parts
       const secParts: string[] = [];
       for (const sm of st.secondaryMetrics) {
-        const val = bestSecondary[sm.name];
-        const bv = baselineSec[sm.name];
+        const val = ownMetric(bestSecondary, sm.name);
+        const bv = ownMetric(baselineSec, sm.name);
         if (val !== undefined) {
           let part = th.fg("muted", `${sm.name}: ${formatNum(val, sm.unit)}`);
           if (bv !== undefined && bv !== 0 && val !== bv) {
@@ -969,7 +976,7 @@ function renderDashboardLines(
 
   // Only show secondary metric columns that have at least one value in rendered rows
   const secMetrics = st.secondaryMetrics.filter((sm) =>
-    rowsToRender.some((r) => (r.metrics ?? {})[sm.name] !== undefined)
+    rowsToRender.some((r) => ownMetric(r.metrics ?? {}, sm.name) !== undefined)
   );
 
   // Column definitions
@@ -984,7 +991,7 @@ function renderDashboardLines(
   const secColWidths: number[] = secMetrics.map((sm) => {
     let maxW = visibleWidth(sm.name);
     for (const r of rowsToRender) {
-      const val = (r.metrics ?? {})[sm.name];
+      const val = ownMetric(r.metrics ?? {}, sm.name);
       if (val !== undefined) {
         maxW = Math.max(maxW, visibleWidth(formatNum(val, sm.unit)));
       }
@@ -1101,12 +1108,12 @@ function renderDashboardLines(
     for (let si = 0; si < visibleSecMetrics.length; si++) {
       const sm = visibleSecMetrics[si];
       const colW = secColWidths[si];
-      const val = rowMetrics[sm.name];
+      const val = ownMetric(rowMetrics, sm.name);
       if (val !== undefined) {
         const secStr = formatNum(val, sm.unit);
         let secColor: Parameters<typeof th.fg>[0] = "dim";
         if (!isOld) {
-          const bv = baselineSecondary[sm.name];
+          const bv = ownMetric(baselineSecondary, sm.name);
           if (isBaseline) {
             secColor = "text";
           } else if (bv !== undefined && bv !== 0) {
@@ -2407,7 +2414,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const def = state.secondaryMetrics.find((m) => m.name === name);
           const unit = def?.unit ?? "";
           let part = `${name}: ${formatNum(value, unit)}`;
-          const bv = baselines[name];
+          const bv = ownMetric(baselines, name);
           if (bv !== undefined && state.results.length > 1 && bv !== 0) {
             const d = value - bv;
             const p = ((d / bv) * 100).toFixed(1);

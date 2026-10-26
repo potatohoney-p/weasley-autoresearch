@@ -64,11 +64,10 @@ function inferMetricUnit(name: string): string {
 function metricMapFrom(value: unknown): Record<string, number> {
   if (!isObjectRecord(value)) return {};
 
-  const metrics: Record<string, number> = {};
-  for (const [name, metric] of Object.entries(value)) {
-    if (typeof metric === "number") metrics[name] = metric;
-  }
-  return metrics;
+  // Define data properties rather than invoking Object.prototype setters.
+  return Object.fromEntries(
+    Object.entries(value).filter(([, metric]) => typeof metric === "number")
+  );
 }
 
 function statusFrom(value: unknown): ReconstructedRun["status"] {

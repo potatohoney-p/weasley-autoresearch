@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve secondary metric names such as `__proto__` during JSONL recovery and use only
+  own metric values for dashboard and log-result baselines, avoiding inherited values and NaN deltas.
+
 ## [1.6.3] - 2026-08-02
 
 ### Added
