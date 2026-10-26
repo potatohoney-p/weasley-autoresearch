@@ -143,6 +143,17 @@ stdout is delivered to the agent as bounded steering context. Non-zero exits and
 reported and logged rather than hidden. Examples live in
 [`skills/autoresearch-hooks/examples/`](skills/autoresearch-hooks/examples).
 
+### Compaction source failures
+
+Active AutoResearch compaction is canceled if an existing log, rules, or ideas
+source cannot be read, rather than replacing history with an incomplete summary.
+The source files are not repaired or overwritten. Repair the reported file and
+retry compaction; truly absent optional files retain their existing behavior.
+A dangling source symlink is treated as a read failure, not as an empty source.
+Cancellation clears the pending continuation for that compaction, but does not
+turn off AutoResearch or abort an ongoing experiment. This is a read-error guard,
+not JSONL schema validation or an atomic snapshot of concurrently edited files.
+
 ## Testing
 
 ```bash

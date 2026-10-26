@@ -49,6 +49,7 @@ import {
 import {
   autoresearchSummaryPathsFor,
   buildAutoresearchCompactionSummary,
+  CompactionSourceReadError,
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
@@ -1576,8 +1577,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   pi.on("session_before_compact", async (event, ctx) => {
-    pausePendingResume(getRuntime(ctx));
-    return autoresearchCompactionFor(ctx, event);
+    const runtime = getRuntime(ctx);
+    pausePendingResume(runtime);
+    try {
+      return autoresearchCompactionFor(ctx, event);
+    } catch (error) {
+      // The host catches thrown extension errors and may continue with default
+      // compaction. Return explicit cancellation so failed source reads cannot
+      // replace history with an incomplete summary or resume message.
+      cancelPendingResume(runtime);
+      const detail = error instanceof CompactionSourceReadError
+        ? error.message
+        : "Unable to prepare persisted session sources. Repair them before retrying.";
+      try {
+        ctx.ui.notify(`Autoresearch compaction canceled: ${detail}`, "error");
+      } catch {
+        // Notification delivery must not suppress the cancellation contract.
+      }
+      return { cancel: true };
+    }
   });
 
   pi.on("session_compact", async (_event, ctx) => {
