@@ -192,6 +192,17 @@ interface AutoresearchRuntime {
 // Tool Schemas
 // ---------------------------------------------------------------------------
 
+const MAX_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
+
+// Node timers clamp overflowing delays to 1 ms. Validate before launching work.
+function timeoutMilliseconds(value: unknown, fallback: number, name: string): number {
+  const seconds = value === undefined ? fallback : value;
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0 || seconds > MAX_TIMEOUT_SECONDS) {
+    throw new Error(`Invalid ${name}: expected a finite number from 0 to ${MAX_TIMEOUT_SECONDS} seconds (0 disables the timeout).`);
+  }
+  return seconds === 0 ? 0 : Math.max(1, Math.floor(seconds * 1000));
+}
+
 const RunParams = Type.Object({
   command: Type.String({
     description:
@@ -199,13 +210,17 @@ const RunParams = Type.Object({
   }),
   timeout_seconds: Type.Optional(
     Type.Number({
-      description: "Kill after this many seconds (default: 600)",
+      description: "Kill after this many seconds (default: 600; 0 disables timeout)",
+      minimum: 0,
+      maximum: MAX_TIMEOUT_SECONDS,
     })
   ),
   checks_timeout_seconds: Type.Optional(
     Type.Number({
       description:
-        "Kill .auto/checks.sh after this many seconds (default: 300). Only relevant when the checks file exists.",
+        "Kill .auto/checks.sh after this many seconds (default: 300; 0 disables timeout). Validated even when checks are absent.",
+      minimum: 0,
+      maximum: MAX_TIMEOUT_SECONDS,
     })
   ),
 });
@@ -1796,7 +1811,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      const timeout = (params.timeout_seconds ?? 600) * 1000;
+      let timeout: number;
+      let checksTimeout: number;
+      try {
+        timeout = timeoutMilliseconds(params.timeout_seconds, 600, "timeout_seconds");
+        checksTimeout = timeoutMilliseconds(params.checks_timeout_seconds, 300, "checks_timeout_seconds");
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `❌ ${(error as Error).message}` }],
+          details: {},
+        };
+      }
 
       // Guard: if the benchmark script exists, only allow running it
       const autoresearchShPath = autoresearchScriptPath(workDir);
@@ -2006,7 +2032,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const checksPath = autoresearchChecksPath(workDir);
       if (benchmarkPassed && fs.existsSync(checksPath)) {
-        const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
         const ct0 = Date.now();
         try {
           const checksResult = await pi.exec("bash", [checksPath], {

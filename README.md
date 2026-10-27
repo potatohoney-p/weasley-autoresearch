@@ -177,3 +177,15 @@ Keep safety behavior fail-closed, add regression coverage for Git/config changes
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+### Experiment timeout admission
+
+`run_experiment` validates both `timeout_seconds` and `checks_timeout_seconds`
+before launching the benchmark, even if no checks file exists. Omitted values keep
+600-second benchmark and 300-second checks defaults. Explicit `0` keeps the existing
+no-timeout option. Other values must be finite numbers from 0 through 2147483.647
+seconds; negative values, null, and overflowing delays are rejected rather than
+silently disabling a timer or letting Node clamp it to 1 ms. Positive fractional
+seconds are converted to whole milliseconds, rounding down with a minimum of 1 ms.
+This is argument validation, not a hard real-time guarantee or a redesign of process
+termination, cancellation, or evidence recovery.
