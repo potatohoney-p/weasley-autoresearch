@@ -177,3 +177,16 @@ Keep safety behavior fail-closed, add regression coverage for Git/config changes
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+### Benchmark output persistence
+
+Large benchmark output is streamed to a temporary log. `run_experiment` waits for
+the stream to finish before returning the completed output path. Benchmark
+duration ends when the child closes; waiting for artifact finalization does not
+inflate the reported benchmark duration. An output-file
+open, write, finalization, or premature-close failure rejects the run rather than
+crashing the host or advertising an incomplete log as successful. The benchmark
+is terminated using the existing best-effort process-tree termination. A partial
+file can remain for diagnosis; no automatic retry or deletion occurs. This is not
+a disk durability (`fsync`) guarantee or a redesign of backpressure, process
+termination escalation, metric parsing, or experiment evidence policy.

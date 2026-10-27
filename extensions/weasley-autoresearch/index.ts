@@ -1832,12 +1832,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Spawn the process directly (like the bash tool) for streaming output
       const getTempFile = createTempFileAllocator();
-      const { exitCode, killed: timedOut, output, tempFilePath: streamTempFile, actualTotalBytes } = await new Promise<{
+      const { exitCode, killed: timedOut, output, tempFilePath: streamTempFile, actualTotalBytes, completedAt } = await new Promise<{
         exitCode: number | null;
         killed: boolean;
         output: string;
         tempFilePath: string | undefined;
         actualTotalBytes: number;
+        completedAt: number;
       }>((resolve, reject) => {
         let processTimedOut = false;
 
@@ -1856,6 +1857,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         let tempFilePath: string | undefined;
         let tempFileStream: ReturnType<typeof createWriteStream> | undefined;
         let totalBytes = 0;
+        let outputError: Error | undefined;
+        let outputFinished: Promise<void> | undefined;
+        const failOutput = (error: unknown): void => {
+          outputError ??= error instanceof Error ? error : new Error(String(error));
+          if (child.pid && child.exitCode === null && child.signalCode === null) killTree(child.pid);
+        };
 
         // Cache for Buffer.concat — only rebuild when chunks change
         let chunksGeneration = 0;
@@ -1893,15 +1900,28 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
           // Start writing to temp file once we exceed the threshold
           if (totalBytes > DEFAULT_MAX_BYTES && !tempFilePath) {
-            tempFilePath = getTempFile();
-            tempFileStream = createWriteStream(tempFilePath);
-            for (const chunk of chunks) {
-              tempFileStream.write(chunk);
+            try {
+              tempFilePath = getTempFile();
+              tempFileStream = createWriteStream(tempFilePath);
+              const stream = tempFileStream;
+              // Observe failures immediately, but settle only after child cleanup.
+              // Resolve on error too so there is no unhandled rejected promise.
+              outputFinished = new Promise<void>((done) => {
+                stream.once("error", (error) => { failOutput(error); done(); });
+                stream.once("finish", done);
+                stream.once("close", () => {
+                  if (!stream.writableFinished && !outputError) failOutput(new Error("Output stream closed before finishing"));
+                  done();
+                });
+              });
+              for (const chunk of chunks) stream.write(chunk);
+            } catch (error) {
+              failOutput(error);
             }
           }
 
-          if (tempFileStream) {
-            tempFileStream.write(data);
+          if (tempFileStream && !outputError) {
+            try { tempFileStream.write(data); } catch (error) { failOutput(error); }
           }
 
           // Keep rolling buffer of recent data
@@ -1968,12 +1988,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           reject(err);
         });
 
-        child.on("close", (code) => {
+        child.on("close", async (code) => {
+          const completedAt = Date.now();
           clearInterval(timerInterval);
           if (timeoutHandle) clearTimeout(timeoutHandle);
           if (signal) signal.removeEventListener("abort", onAbort);
           if (tempFileStream) tempFileStream.end();
 
+          if (outputFinished) await outputFinished;
+          if (outputError) {
+            reject(new Error(`Failed to persist benchmark output: ${outputError.message}`));
+            return;
+          }
           if (signal?.aborted) {
             reject(new Error("aborted"));
             return;
@@ -1986,6 +2012,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             output: fullBuffer.toString("utf-8"),
             tempFilePath,
             actualTotalBytes: totalBytes,
+            completedAt,
           });
         });
       }).finally(() => {
@@ -1994,7 +2021,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (overlayTui) overlayTui.requestRender();
       });
 
-      const durationSeconds = (Date.now() - t0) / 1000;
+      const durationSeconds = (completedAt - t0) / 1000;
       runtime.lastRunDuration = durationSeconds;
       const benchmarkPassed = exitCode === 0 && !timedOut;
 
