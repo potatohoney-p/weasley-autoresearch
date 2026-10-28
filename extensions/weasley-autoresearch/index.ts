@@ -158,6 +158,8 @@ interface RunDetails {
   checksTimedOut: boolean;
   checksOutput: string;
   checksDuration: number;
+  /** Optional synchronous progress delivery failed; execution results remain authoritative. */
+  progressUpdateFailed?: boolean;
   /** Metrics parsed from METRIC lines in output. null if none found. */
   parsedMetrics: Record<string, number> | null;
   /** Primary metric value extracted from parsedMetrics (matching metricName). null if not found. */
@@ -1829,6 +1831,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (overlayTui) overlayTui.requestRender();
 
       const t0 = Date.now();
+      let progressUpdateFailed = false;
 
       // Spawn the process directly (like the bash tool) for streaming output
       const getTempFile = createTempFileAllocator();
@@ -1871,21 +1874,28 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
         // Timer interval — update every second with elapsed time + tail output
         const timerInterval = setInterval(() => {
-          if (!onUpdate) return;
+          if (!onUpdate || progressUpdateFailed) return;
           const elapsed = formatElapsed(Date.now() - t0);
           const trunc = truncateTail(getBufferText(), {
             maxLines: DEFAULT_MAX_LINES,
             maxBytes: DEFAULT_MAX_BYTES,
           });
-          onUpdate({
-            content: [{ type: "text", text: trunc.content || "" }],
-            details: {
-              phase: "running",
-              elapsed,
-              truncation: trunc.truncated ? trunc : undefined,
-              fullOutputPath: tempFilePath,
-            },
-          });
+          try {
+            onUpdate({
+              content: [{ type: "text", text: trunc.content || "" }],
+              details: {
+                phase: "running",
+                elapsed,
+                truncation: trunc.truncated ? trunc : undefined,
+                fullOutputPath: tempFilePath,
+              },
+            });
+          } catch {
+            // The host progress callback is optional and synchronous. Do not let a
+            // display failure escape this timer and terminate the host process.
+            // Disable only this run's observer; never replay the benchmark.
+            progressUpdateFailed = true;
+          }
         }, 1000);
 
         const handleData = (data: Buffer) => {
@@ -2069,6 +2079,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         checksTimedOut,
         checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
         checksDuration,
+        ...(progressUpdateFailed ? { progressUpdateFailed: true } : {}),
         parsedMetrics,
         parsedPrimary,
         metricName: state.metricName,
@@ -2094,6 +2105,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (checksPass === true) {
           text += `✅ Checks passed in ${checksDuration.toFixed(1)}s\n`;
         }
+      }
+
+      if (progressUpdateFailed) {
+        text += "⚠ Progress updates stopped after a callback failure; benchmark and checks results are unchanged.\n";
       }
 
       if (state.bestMetric !== null) {

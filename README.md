@@ -21,6 +21,15 @@ reverts regressions while preserving an auditable session log. The published pac
 - Strict configuration parsing: malformed or unknown settings fail closed instead of silently
   falling back to a different directory or iteration policy.
 
+## Progress delivery failures
+
+Benchmark progress callbacks are optional synchronous observers. If one throws, that run stops
+calling it and continues the benchmark and correctness checks without replay. The final tool
+result includes `progressUpdateFailed: true` and a warning; exit status, timeout and check
+results remain authoritative. Later runs start with a fresh observer. Cancellation still
+rejects normally and does not promise a final warning. This does not contain unrelated widget
+or renderer exceptions, or support asynchronous/rejecting progress callbacks.
+
 ## Requirements
 
 - Node.js 22.19 or newer
