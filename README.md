@@ -76,6 +76,24 @@ The shortcut can be changed or disabled in the active Pi agent directory at
 
 Set the shortcut to `null` to disable it.
 
+## Benchmark cancellation
+
+`run_experiment` rejects calls whose abort signal is already cancelled without launching a
+benchmark. On timeout, cancellation, or output-artifact failure during a benchmark, it requests `SIGTERM`, then after
+250 ms requests `SIGKILL` for the same process group (falling back to the direct child
+only while it has not been observed to exit).
+Escalation remains active even if the direct child exits first. The runner then releases its
+owned output pipes so detached descendants cannot hold the tool open indefinitely.
+
+Timeout remains a failed benchmark even if a termination handler exits zero; correctness checks
+are not run. Cancellation rejects with `aborted`. Output-artifact failure rejects with the original
+persistence error after cleanup, even when benchmark timeout is disabled; it never runs correctness
+checks or reports a partial artifact as successful. Measured duration includes this cleanup grace.
+This is best-effort process cleanup, not a security sandbox or a hard real-time deadline:
+escaped descendants can continue running, Windows cleanup is limited to the direct child, and
+blocking event-loop work or output storage can still delay completion. Hook/check subprocess
+policies are unchanged. Captured output may end at the cleanup boundary.
+
 ## Session files
 
 All current session artifacts live under `.auto/` in the effective working directory:
