@@ -1899,6 +1899,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           });
         }, 1000);
 
+        // Both readable pipes feed one sink. Pause both when it asks for pressure;
+        // otherwise stderr can continue filling the same queue while stdout waits.
+        const writeOutput = (data: Buffer): void => {
+          try {
+            if (tempFileStream && !tempFileStream.write(data)) {
+              child.stdout?.pause();
+              child.stderr?.pause();
+            }
+          } catch (error) { failOutput(error); }
+        };
+
         const handleData = (data: Buffer) => {
           totalBytes += data.length;
 
@@ -1908,6 +1919,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               tempFilePath = getTempFile();
               tempFileStream = createWriteStream(tempFilePath);
               const stream = tempFileStream;
+              stream.on("drain", () => {
+                if (!outputError && !finished) {
+                  child.stdout?.resume();
+                  child.stderr?.resume();
+                }
+              });
               // Observe failures immediately, but settle only after child cleanup.
               // Resolve on error too so there is no unhandled rejected promise.
               outputFinished = new Promise<void>((done) => {
@@ -1918,14 +1935,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
                   done();
                 });
               });
-              for (const chunk of chunks) stream.write(chunk);
+              for (const chunk of chunks) writeOutput(chunk);
             } catch (error) {
               failOutput(error);
             }
           }
 
           if (tempFileStream && !outputError) {
-            try { tempFileStream.write(data); } catch (error) { failOutput(error); }
+            writeOutput(data);
           }
 
           // Keep rolling buffer of recent data

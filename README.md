@@ -206,5 +206,13 @@ open, write, finalization, or premature-close failure rejects the run rather tha
 crashing the host or advertising an incomplete log as successful. The benchmark
 is terminated using the existing best-effort process-tree termination. A partial
 file can remain for diagnosis; no automatic retry or deletion occurs. This is not
-a disk durability (`fsync`) guarantee or a redesign of backpressure, process
-termination escalation, metric parsing, or experiment evidence policy.
+a disk durability (`fsync`) guarantee or a change to metric parsing or experiment
+evidence policy.
+
+When the output file asks for backpressure, both benchmark pipes pause until its
+`drain` event. This prevents a slow sink from queuing the entire benchmark output
+in Node memory. The initial buffered prefix and the current pipe chunk can still
+exceed the sink high-water mark; this is not a fixed process-memory or disk quota.
+Slow storage can slow the benchmark and contribute to its timeout and measured
+duration. Final flush waiting remains excluded from the duration. Cancellation
+retains best-effort cleanup; storage that never completes can still delay finalization.
