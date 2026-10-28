@@ -353,12 +353,13 @@ function formatElapsed(ms: number): string {
 }
 
 /** Kill a process tree (best effort, tries process group first) */
-function killTree(pid: number): void {
+function killTree(pid: number, signal: NodeJS.Signals = "SIGTERM", allowDirectFallback = true): void {
   try {
-    process.kill(-pid, "SIGTERM");
+    process.kill(-pid, signal);
   } catch {
+    if (!allowDirectFallback) return;
     try {
-      process.kill(pid, "SIGTERM");
+      process.kill(pid, signal);
     } catch {
       // Process may have already exited
     }
@@ -1823,6 +1824,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      // Do not launch already-cancelled work, even briefly.
+      if (signal?.aborted) throw new Error("aborted");
+
       // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       updateWidget(ctx);
@@ -1931,63 +1935,67 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (child.stdout) child.stdout.on("data", handleData);
         if (child.stderr) child.stderr.on("data", handleData);
 
-        // Timeout
+        // Cancellation is a bounded cleanup phase, not just a signal request.
+        // Keep escalation alive even if the direct child exits first: descendants
+        // in its process group can still be running or retaining output pipes.
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-        if (timeout > 0) {
-          timeoutHandle = setTimeout(() => {
-            processTimedOut = true;
-            if (child.pid) killTree(child.pid);
-          }, timeout);
-        }
+        let escalationHandle: ReturnType<typeof setTimeout> | undefined;
+        let stopping = false;
+        let finished = false;
+        let observedExitCode: number | null = null;
+        let childExited = false;
 
-        // Abort signal — kill immediately if pid exists, otherwise queue for spawn.
-        // Using child.kill() as fallback ensures the signal is never silently swallowed.
-        const onAbort = () => {
-          if (child.pid) killTree(child.pid);
-          else {
-            // pid not yet assigned — try child.kill() which works without pid,
-            // and also queue killTree for spawn in case child.kill() isn't enough
-            // to clean up the full process tree.
-            child.kill();
-            child.once("spawn", () => { if (child.pid) killTree(child.pid); });
-          }
-        };
-        if (signal) {
-          if (signal.aborted) {
-            onAbort();
-          } else {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-        }
-
-        child.on("error", (err) => {
+        const finish = (error?: Error) => {
+          if (finished) return;
+          finished = true;
           clearInterval(timerInterval);
           if (timeoutHandle) clearTimeout(timeoutHandle);
+          if (escalationHandle) clearTimeout(escalationHandle);
           if (signal) signal.removeEventListener("abort", onAbort);
           if (tempFileStream) tempFileStream.end();
-          reject(err);
-        });
-
-        child.on("close", (code) => {
-          clearInterval(timerInterval);
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          if (signal) signal.removeEventListener("abort", onAbort);
-          if (tempFileStream) tempFileStream.end();
-
-          if (signal?.aborted) {
-            reject(new Error("aborted"));
+          if (error || signal?.aborted) {
+            reject(error ?? new Error("aborted"));
             return;
           }
-
-          const fullBuffer = Buffer.concat(chunks);
           resolve({
-            exitCode: code,
+            exitCode: observedExitCode,
             killed: processTimedOut,
-            output: fullBuffer.toString("utf-8"),
+            output: Buffer.concat(chunks).toString("utf-8"),
             tempFilePath,
             actualTotalBytes: totalBytes,
           });
+        };
+        const stop = () => {
+          if (stopping || finished) return;
+          stopping = true;
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+          if (child.pid) killTree(child.pid, "SIGTERM", !childExited);
+          else child.once("spawn", () => { if (child.pid) killTree(child.pid); });
+          escalationHandle = setTimeout(() => {
+            if (child.pid) killTree(child.pid, "SIGKILL", !childExited);
+            // An escaped descendant may retain inherited pipes indefinitely.
+            // Release only our handles; do not claim those jobs were terminated.
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+            child.unref();
+            finish();
+          }, 250);
+        };
+        const onAbort = () => stop();
+        child.on("exit", (code) => { childExited = true; observedExitCode = code; });
+        child.on("error", (err) => finish(err));
+        child.on("close", (code) => {
+          observedExitCode = code;
+          if (!stopping) finish();
         });
+        if (timeout > 0) {
+          timeoutHandle = setTimeout(() => {
+            processTimedOut = true;
+            stop();
+          }, timeout);
+        }
+        if (signal?.aborted) onAbort();
+        else signal?.addEventListener("abort", onAbort, { once: true });
       }).finally(() => {
         runtime.runningExperiment = null;
         updateWidget(ctx);
