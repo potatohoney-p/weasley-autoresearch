@@ -66,7 +66,23 @@ export function buildAutoresearchCompactionSummary(paths: AutoresearchSummaryPat
 }
 
 function loadState(jsonlPath: string): ReconstructedJsonlState {
-  return reconstructJsonlState(readFileOrEmpty(jsonlPath));
+  const content = readFileOrEmpty(jsonlPath);
+  // Normal session reconstruction is intentionally tolerant, but compaction
+  // must not discard conversation history after silently dropping damaged log
+  // records. Validate this same read before reconstructing; never reread it.
+  for (const [index, line] of content.split("\n").entries()) {
+    if (!line.trim()) continue;
+    let record: unknown;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      throw new CompactionLogFormatError(jsonlPath, index + 1);
+    }
+    if (record === null || typeof record !== "object" || Array.isArray(record)) {
+      throw new CompactionLogFormatError(jsonlPath, index + 1);
+    }
+  }
+  return reconstructJsonlState(content);
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +269,14 @@ function formatAsiField(asi: Record<string, unknown>, key: string, label: string
 
 function readTrimmedFile(filePath: string): string {
   return readFileOrEmpty(filePath).trim();
+}
+
+export class CompactionLogFormatError extends Error {
+  constructor(filePath: string, lineNumber: number) {
+    // Do not include JSON.parse errors: they can contain sensitive log data.
+    super(`Invalid compaction log record: ${filePath}, line ${lineNumber}. Expected a complete JSON object. Repair the file before retrying.`);
+    this.name = "CompactionLogFormatError";
+  }
 }
 
 export class CompactionSourceReadError extends Error {

@@ -446,7 +446,17 @@ retry compaction; truly absent optional files retain their existing behavior.
 A dangling source symlink is treated as a read failure, not as an empty source.
 Cancellation clears the pending continuation for that compaction, but does not
 turn off AutoResearch or abort an ongoing experiment. This is a read-error guard,
-not JSONL schema validation or an atomic snapshot of concurrently edited files.
+not full JSONL schema validation or an atomic snapshot of concurrently edited files.
+
+Before replacing conversation history, compaction checks every nonblank log line
+from the same file read for a complete JSON object. Malformed/truncated JSON and
+non-object values cancel compaction with the file path and physical line number,
+without copying the offending payload into the diagnostic. Repair the log and retry;
+no records are automatically discarded or rewritten. Whitespace-only lines, CRLF,
+a complete final object without a newline, and unknown object record types remain
+allowed. Existing field/schema filtering and normal session reconstruction remain
+unchanged. This does not validate metric semantics or promise a concurrent append
+snapshot; a partially written final record requires retry after the writer finishes.
 
 ## Testing
 

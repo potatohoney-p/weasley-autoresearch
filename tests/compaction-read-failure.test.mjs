@@ -133,3 +133,54 @@ test('dangling current layout directory cannot fall back to legacy rules', { ski
   assert.throws(() => autoresearchSummaryPathsFor(cwd), /compaction source/);
   assert.equal(fs.readlinkSync(path.join(cwd, '.auto')), 'missing-current-directory');
 });
+
+for (const invalidLine of ['{"run":2,', 'secret invalid payload', 'null', '[]', '42', '"a string"']) {
+  test(`compaction refuses malformed or non-object log record: ${invalidLine}`, async t => {
+    const cwd = fixture(t); const h = await harness(cwd);
+    const file = path.join(cwd, '.auto', 'log.jsonl');
+    const damaged = log + '\n \t\r\n' + invalidLine + '\n';
+    fs.writeFileSync(file, damaged);
+    assert.throws(() => buildAutoresearchCompactionSummary(autoresearchSummaryPathsFor(cwd)), error => {
+      assert.match(error.message, /log.*line 5/i);
+      assert.ok(!error.message.includes(invalidLine), 'diagnostic must not leak log payload');
+      return true;
+    });
+    assert.deepEqual(await h.compact(), { cancel: true });
+    assert.match(h.notices.at(-1).message, /line 5/);
+    assert.equal(fs.readFileSync(file, 'utf8'), damaged);
+    fs.writeFileSync(file, log);
+    assert.match((await h.compact()).compaction.summary, /Runs so far: 1/);
+  });
+}
+
+test('compaction accepts blank lines, CRLF and complete final object without newline', t => {
+  const cwd = fixture(t);
+  fs.writeFileSync(path.join(cwd, '.auto', 'log.jsonl'), '\r\n \t\r\n' + log.trimEnd().replaceAll('\n', '\r\n'));
+  assert.match(buildAutoresearchCompactionSummary(autoresearchSummaryPathsFor(cwd)), /Runs so far: 1/);
+});
+
+test('compaction retains forward-compatible unknown object records without full schema validation', t => {
+  const cwd = fixture(t);
+  fs.appendFileSync(path.join(cwd, '.auto', 'log.jsonl'), '{"type":"future_metadata","value":1}\n');
+  assert.match(buildAutoresearchCompactionSummary(autoresearchSummaryPathsFor(cwd)), /Runs so far: 1/);
+});
+
+test('malformed legacy log also blocks compaction without rewriting it', t => {
+  const cwd = fixture(t); fs.rmSync(path.join(cwd, '.auto'), { recursive: true });
+  const file = path.join(cwd, 'autoresearch.jsonl'); fs.writeFileSync(file, log + '{broken');
+  assert.throws(() => buildAutoresearchCompactionSummary(autoresearchSummaryPathsFor(cwd)), /line 3/);
+  assert.equal(fs.readFileSync(file, 'utf8'), log + '{broken');
+});
+
+test('malformed logs cancel pending continuation and inactive compaction stays untouched', async t => {
+  const cwd = fixture(t); const h = await harness(cwd);
+  t.after(() => h.handlers.get('session_shutdown')({}, h.ctx));
+  await h.handlers.get('session_compact')({}, h.ctx);
+  fs.appendFileSync(path.join(cwd, '.auto', 'log.jsonl'), '{broken');
+  assert.deepEqual(await h.compact(), { cancel: true });
+  await h.handlers.get('agent_end')({}, h.ctx);
+  await new Promise(resolve => setTimeout(resolve, 900));
+  assert.deepEqual(h.sent, []);
+  const inactive = await harness(cwd, false);
+  assert.equal(await inactive.compact(), undefined);
+});
