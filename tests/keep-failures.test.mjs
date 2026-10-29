@@ -207,7 +207,9 @@ for (const failure of [
     await mkdir(join(h.cwd, ".auto/hooks"), { recursive: true });
     const hookPath = join(h.cwd, `.auto/hooks/${failure.stage}.sh`);
     const steering = `${failure.stage} hook steering`;
-    await writeFile(hookPath, `printf '${steering}\\n'\n`, { mode: 0o755 });
+    // These hooks test post-publication steering, not early stdin closure.
+    // Drain the real payload before exiting so EPIPE cannot alter steering text.
+    await writeFile(hookPath, `cat > /dev/null\nprintf '${steering}\\n'\n`, { mode: 0o755 });
     let injectedFailures = 0;
     const message = `injected ${failure.stage} hook ${failure.kind} failure`;
     if (failure.kind === "invocation") {
@@ -231,7 +233,7 @@ for (const failure of [
     }
 
     const result = await h.call("log_experiment", keep);
-    assert.equal(injectedFailures, 1, "the intended post-publication failure must actually execute");
+    assert.equal(injectedFailures, 1, `the intended post-publication failure must actually execute: ${JSON.stringify(h.messages)}`);
     assert.notEqual(result.isError, true, "a follow-up failure cannot undo a recorded keep");
     assert.equal(result.details.experiment.status, "keep");
     assert.equal(result.details.experiment.commit, before.slice(0, 7));
@@ -266,7 +268,7 @@ for (const failure of [
 
     await writeFile(join(h.cwd, "candidate.txt"), "next candidate\n");
     const nextRun = await h.call("run_experiment", benchmark);
-    assert.equal(nextRun.details.passed, true);
+    assert.equal(nextRun.details.passed, true, JSON.stringify(nextRun));
     assert.equal(nextRun.details.checksPass, true);
     const next = await h.call("log_experiment", { ...keep, metric: 1, description: "fresh benchmark keep" });
     assert.notEqual(next.isError, true);
@@ -278,7 +280,7 @@ for (const failure of [
     assert.doesNotMatch(text(next), /hook(?: steering)? failed:/);
     assert.deepEqual((await loggedKeeps()).map((entry) => entry.run), [1, 2]);
     assert.ok(h.messages.some(([value, options]) => value === steering && options?.deliverAs === "steer"),
-      "the real hook and steering still work after removing the fault");
+      `the real hook and steering still work after removing the fault: ${JSON.stringify(h.messages)}`);
   });
 }
 
