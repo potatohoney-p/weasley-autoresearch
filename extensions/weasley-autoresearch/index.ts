@@ -2850,6 +2850,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   let dashboardServerPort: number | null = null;
   let dashboardServerWorkDir: string | null = null;
   let dashboardServerHtmlPath: string | null = null;
+  let dashboardGeneration = 0;
+  let pendingDashboard: {
+    server: Server;
+    workDir: string;
+    promise: Promise<number>;
+    reject: (error: Error) => void;
+  } | null = null;
   const dashboardSseClients = new Set<ServerResponse>();
 
   function openInBrowser(url: string): void {
@@ -2870,6 +2877,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   function stopDashboardServer(): void {
+    dashboardGeneration++;
+    if (pendingDashboard) {
+      const pending = pendingDashboard;
+      pendingDashboard = null;
+      pending.reject(new Error("Dashboard export cancelled"));
+      try { pending.server.close(); } catch { /* ignore */ }
+    }
     for (const client of dashboardSseClients) {
       try { client.end(); } catch { /* ignore */ }
     }
@@ -2941,59 +2955,81 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   function startStaticServer(workDir: string, dashboardHtmlPath: string): Promise<number> {
-    return new Promise((resolve, reject) => {
-      const resolvedWorkDir = path.resolve(workDir);
-      const resolvedDashboardHtmlPath = path.resolve(dashboardHtmlPath);
+    const resolvedWorkDir = path.resolve(workDir);
+    const resolvedDashboardHtmlPath = path.resolve(dashboardHtmlPath);
+    if (dashboardServer && dashboardServerWorkDir === resolvedWorkDir && dashboardServerPort) {
+      dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+      return Promise.resolve(dashboardServerPort);
+    }
+    if (pendingDashboard?.workDir === resolvedWorkDir) {
+      dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+      return pendingDashboard.promise;
+    }
 
-      if (dashboardServer && dashboardServerWorkDir === resolvedWorkDir && dashboardServerPort) {
-        dashboardServerHtmlPath = resolvedDashboardHtmlPath;
-        resolve(dashboardServerPort);
+    stopDashboardServer();
+    const generation = dashboardGeneration;
+    dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+    let resolve!: (port: number) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<number>((res, rej) => { resolve = res; reject = rej; });
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+
+      if (url.pathname === "/events") {
+        registerSseClient(res);
         return;
       }
 
-      stopDashboardServer();
-      dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+      const filePath = resolveServedFile(resolvedWorkDir, url.pathname);
+      if (!filePath) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
 
-      const server = createServer((req, res) => {
-        const url = new URL(req.url ?? "/", "http://127.0.0.1");
-
-        if (url.pathname === "/events") {
-          registerSseClient(res);
-          return;
-        }
-
-        const filePath = resolveServedFile(resolvedWorkDir, url.pathname);
-        if (!filePath) {
+      fs.readFile(filePath, (err, data) => {
+        if (err) {
           res.writeHead(404);
           res.end();
           return;
         }
-
-        fs.readFile(filePath, (err, data) => {
-          if (err) {
-            res.writeHead(404);
-            res.end();
-            return;
-          }
-          res.writeHead(200, { "Content-Type": fileContentType(filePath) });
-          res.end(data);
-        });
+        res.writeHead(200, { "Content-Type": fileContentType(filePath) });
+        res.end(data);
       });
+    });
 
+    pendingDashboard = { server, workDir: resolvedWorkDir, promise, reject };
+    const fail = (error: Error) => {
+      // The error handler also remains active after listen succeeds. Retire only
+      // this server's ownership; a late error from a replaced server is harmless.
+      if (dashboardServer === server) stopDashboardServer();
+      if (pendingDashboard?.server === server) pendingDashboard = null;
+      try { server.close(); } catch { /* ignore */ }
+      reject(error);
+    };
+    server.on("error", fail);
+    try {
       server.listen(0, "127.0.0.1", () => {
-        const address = server.address();
-        if (!address || typeof address === "string") {
-          reject(new Error("Failed to bind dashboard server"));
+        if (generation !== dashboardGeneration) {
+          server.close();
           return;
         }
+        const address = server.address();
+        if (!address || typeof address === "string") {
+          fail(new Error("Failed to bind dashboard server"));
+          return;
+        }
+        pendingDashboard = null;
         dashboardServer = server;
         dashboardServerPort = address.port;
         dashboardServerWorkDir = resolvedWorkDir;
         resolve(address.port);
       });
 
-      server.on("error", reject);
-    });
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error(String(error)));
+    }
+    return promise;
   }
 
   async function exportDashboard(ctx: ExtensionContext): Promise<void> {
@@ -3012,7 +3048,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     try {
       const dashboardHtmlPath = writeDashboardFile(workDir);
-      const port = await startStaticServer(workDir, dashboardHtmlPath);
+      const starting = startStaticServer(workDir, dashboardHtmlPath);
+      const generation = dashboardGeneration;
+      const port = await starting;
+      if (generation !== dashboardGeneration) return;
       const url = `http://127.0.0.1:${port}`;
       openInBrowser(url);
       ctx.ui.notify(`Dashboard at ${url} (live updates)`, "info");

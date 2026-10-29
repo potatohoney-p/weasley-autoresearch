@@ -62,6 +62,13 @@ Other commands:
 | `/autoresearch export` | Open the local live dashboard. |
 | `Ctrl+Shift+F` | Open the fullscreen terminal dashboard. |
 
+Concurrent dashboard exports for the same working directory share one local server, including
+while it is starting. `off`, `clear`, and session shutdown cancel pending exports and close the
+owned server; a cancelled export does not open a browser or announce a live URL. Exporting another
+working directory replaces the old server. A later explicit export can start a fresh server.
+This lifecycle is extension-wide (not one server per session); it does not change session switching,
+request validation, dashboard temporary-file retention, or browser windows already opened.
+
 The shortcut can be changed or disabled in the active Pi agent directory at
 `<agent-dir>/extensions/weasley-autoresearch.json`. The default agent directory is
 `~/.pi/agent`; `PI_CODING_AGENT_DIR` can override it.
