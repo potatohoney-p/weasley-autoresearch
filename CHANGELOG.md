@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Repeated-benchmark medians and MAD preserve subnormal midpoint rounding instead of
+  underflowing intermediate halves, while retaining overflow-safe large-value averages.
+
 - Kept experiments are published only after a verified Git outcome and successful log append.
   Git errors no longer become successful kept results; uncertain commit or persistence outcomes
   pause the session for explicit reconciliation without retrying or rolling back user work.
