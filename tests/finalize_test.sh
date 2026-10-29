@@ -1082,6 +1082,43 @@ EOF
 # Run all tests
 # ---------------------------------------------------------------------------
 
+test_quoted_input_and_temp_paths() {
+  TESTS_RUN=$((TESTS_RUN + 1))
+  local REPO CONFIG_DIR CONFIG_FILE TEMP_DIR BASE FINAL OUTPUT
+  REPO=$(setup_repo)
+  cd "$REPO"
+  CONFIG_DIR="$REPO/researcher's plans"
+  TEMP_DIR="$REPO/researcher's temp"
+  mkdir -p "$CONFIG_DIR" "$TEMP_DIR"
+  CONFIG_FILE="$CONFIG_DIR/selected groups.json"
+  BASE=$(git merge-base HEAD main)
+  FINAL=$(git rev-parse HEAD)
+  cat > "$CONFIG_FILE" <<EOF
+{"base":"$BASE","trunk":"main","final_tree":"$FINAL","goal":"quoted-paths","groups":[{"title":"Optimize both files","body":"Quoted path regression","last_commit":"$FINAL","slug":"combined"}]}
+EOF
+  # Input and scratch paths both cross the Bash -> Node boundary. Keep these
+  # fixture files ignored so the normal stash/restore path has no extra work.
+  printf "researcher's plans/\nresearcher's temp/\n" >> .git/info/exclude
+  OUTPUT=$(TMPDIR="$TEMP_DIR" bash "$FINALIZE" "$CONFIG_FILE" 2>&1) || {
+    fail_test "quoted input and temp paths" "Script failed: $OUTPUT"
+    cleanup_repo "$REPO"
+    return
+  }
+  [ "$(git branch --show-current)" = "autoresearch/test-session" ] || {
+    fail_test "quoted input and temp paths" "Original branch was not restored"
+    cleanup_repo "$REPO"
+    return
+  }
+  [ "$(git show autoresearch/quoted-paths/01-combined:file_a.txt)" = "optimized_a" ] &&
+  [ "$(git show autoresearch/quoted-paths/01-combined:file_b.txt)" = "optimized_b" ] || {
+    fail_test "quoted input and temp paths" "Generated branch did not preserve the experiment"
+    cleanup_repo "$REPO"
+    return
+  }
+  pass "quoted input and temp paths"
+  cleanup_repo "$REPO"
+}
+
 echo ""
 echo "Running finalize.sh tests..."
 echo ""
@@ -1105,6 +1142,7 @@ test_rollback_on_failure
 test_summary_output
 test_stash_on_dirty_tree
 test_single_group
+test_quoted_input_and_temp_paths
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

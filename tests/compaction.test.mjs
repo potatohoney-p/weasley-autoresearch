@@ -183,3 +183,29 @@ test("delta is computed against the first run of the same segment", () => {
   });
 });
 
+test("compaction preserves distinct fractional benchmark measurements", () => {
+  withTempWorkDir((workDir) => {
+    writeJsonlLines(workDir, [
+      JSON.stringify({ type: "config", name: "Latency", metricName: "seconds", metricUnit: "s", bestDirection: "lower" }),
+      JSON.stringify({ run: 1, metric: 0.000123456789, status: "keep" }),
+      JSON.stringify({ run: 2, metric: 0.000123456788, status: "keep" }),
+    ]);
+    const summary = buildAutoresearchCompactionSummary(autoresearchSummaryPathsFor(workDir));
+    assert.match(summary, /Baseline \(#1\): 0\.000123456789s/);
+    assert.match(summary, /Best\s+\(#2\): 0\.000123456788s/);
+    assert.match(summary, /#1 keep\s+0\.000123456789/);
+    assert.match(summary, /#2 keep\s+0\.000123456788/);
+  });
+});
+
+test("compaction round-trips finite metrics across number magnitudes", () => {
+  for (const metric of [Number.MIN_VALUE, 1e-20, -0.000000123456789, 1.2345678901234567, 123456789.12345679, Number.MAX_VALUE]) {
+    withTempWorkDir((workDir) => {
+      writeJsonlLines(workDir, [JSON.stringify({ run: 1, metric, status: "keep" })]);
+      const summary = buildAutoresearchCompactionSummary(autoresearchSummaryPathsFor(workDir));
+      const displayed = summary.match(/Baseline \(#1\): ([^\n]+)/)?.[1];
+      assert.equal(Number(displayed), metric, `metric ${metric} must survive compaction`);
+      assert.ok(summary.includes(`#1 keep          ${String(metric)}`));
+    });
+  }
+});

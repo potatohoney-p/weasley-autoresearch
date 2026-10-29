@@ -15,7 +15,7 @@ import {
   type ReconstructedJsonlState,
   type ReconstructedRun,
 } from "./jsonl.ts";
-import { sessionFilePath } from "./paths.ts";
+import { AUTO_DIR, sessionFilePath } from "./paths.ts";
 
 const RECENT_RUN_LIMIT = 50;
 
@@ -30,11 +30,21 @@ export interface AutoresearchSummaryPaths {
 }
 
 export function autoresearchSummaryPathsFor(workDir: string): AutoresearchSummaryPaths {
+  const currentDir = path.join(workDir, AUTO_DIR);
+  if (compactionSourceExists(currentDir)) {
+    try {
+      // A dangling layout link must not hide all current sources and select
+      // stale legacy peers. Empty real directories retain legacy fallback.
+      fs.statSync(currentDir);
+    } catch (error) {
+      throw new CompactionSourceReadError(currentDir, error);
+    }
+  }
   return {
     workDir,
-    jsonlPath: sessionFilePath(workDir, "log"),
-    mdPath: sessionFilePath(workDir, "prompt"),
-    ideasPath: sessionFilePath(workDir, "ideas"),
+    jsonlPath: sessionFilePath(workDir, "log", compactionSourceExists),
+    mdPath: sessionFilePath(workDir, "prompt", compactionSourceExists),
+    ideasPath: sessionFilePath(workDir, "ideas", compactionSourceExists),
   };
 }
 
@@ -206,8 +216,9 @@ const STATUS_WIDTH = "checks_failed".length;
 
 function formatMetric(value: number): string {
   if (!Number.isFinite(value)) return "—";
-  if (Number.isInteger(value)) return String(value);
-  return value.toFixed(2);
+  // The summary replaces conversation history, so preserve the persisted
+  // number rather than rounding distinct measurements to the same value.
+  return String(value);
 }
 
 function formatDelta(value: number, baseline: number | null): string {
@@ -244,11 +255,36 @@ function readTrimmedFile(filePath: string): string {
   return readFileOrEmpty(filePath).trim();
 }
 
+export class CompactionSourceReadError extends Error {
+  constructor(filePath: string, cause: unknown) {
+    super(`Unable to read compaction source: ${filePath}. Repair the file before retrying.`, { cause });
+    this.name = "CompactionSourceReadError";
+  }
+}
+
+function compactionSourceExists(filePath: string): boolean {
+  try {
+    fs.lstatSync(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new CompactionSourceReadError(filePath, error);
+  }
+}
+
 function readFileOrEmpty(filePath: string): string {
-  if (!fs.existsSync(filePath)) return "";
   try {
     return fs.readFileSync(filePath, "utf-8");
-  } catch {
-    return "";
+  } catch (error) {
+    // Missing optional sources are allowed, but a dangling symlink is not an
+    // absent source. Do not hide permission, directory, or other read failures.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      try {
+        fs.lstatSync(filePath);
+      } catch (statError) {
+        if ((statError as NodeJS.ErrnoException).code === "ENOENT") return "";
+      }
+    }
+    throw new CompactionSourceReadError(filePath, error);
   }
 }

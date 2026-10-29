@@ -16,11 +16,44 @@ import {
 
 test("hook entries are skipped when identifying run entries", () => {
   const hookEntry = parseJsonlEntry('{"type":"hook","stage":"before","exit_code":0}');
-  const runEntry = parseJsonlEntry('{"run":1,"metric":42}');
+  const runEntry = parseJsonlEntry('{"run":1,"metric":42,"status":"keep"}');
 
   assert.equal(isAutoresearchConfigEntry(hookEntry), false);
   assert.equal(isAutoresearchRunEntry(hookEntry), false);
   assert.equal(isAutoresearchRunEntry(runEntry), true);
+});
+
+test("replay never turns incomplete or invalid outcomes into kept experiments", () => {
+  const invalid = [
+    '{"run":1,"metric":4}',
+    '{"run":2,"metric":4,"status":"unknown"}',
+    '{"run":3,"metric":1e400,"status":"keep"}',
+    '{"run":4,"metric":null,"status":"keep"}',
+    '{"run":0,"metric":4,"status":"keep"}',
+    '{"run":1.5,"metric":4,"status":"keep"}',
+    '{"run":1e400,"metric":4,"status":"keep"}',
+    '{"type":"hook","run":1,"metric":4,"status":"keep"}',
+    '{"run":5,"metric":',
+  ];
+  for (const line of invalid) assert.equal(isAutoresearchRunEntry(parseJsonlEntry(line)), false, line);
+  const recovered = reconstructJsonlState([
+    '{"type":"config","metricName":"latency"}',
+    ...invalid,
+    '{"run":6,"metric":9,"status":"discard"}',
+    '{"run":7,"metric":7,"status":"keep"}',
+  ].join("\n"));
+  assert.deepEqual(recovered.results.map(({ run, metric, status }) => ({ run, metric, status })), [
+    { run: 6, metric: 9, status: "discard" },
+    { run: 7, metric: 7, status: "keep" },
+  ]);
+});
+
+test("replay drops non-finite optional measurements while preserving valid metrics", () => {
+  const state = reconstructJsonlState('{"run":1,"status":"keep","metric":3,"metrics":{"valid_ms":2,"overflow":1e400},"confidence":1e400,"timestamp":1e400}');
+  assert.deepEqual(state.results[0].metrics, { valid_ms: 2 });
+  assert.deepEqual(state.secondaryMetrics, [{ name: "valid_ms", unit: "ms" }]);
+  assert.equal(state.results[0].confidence, null);
+  assert.equal(state.results[0].timestamp, 0);
 });
 
 test("hook-only jsonl does not count as having a config header", () => {
