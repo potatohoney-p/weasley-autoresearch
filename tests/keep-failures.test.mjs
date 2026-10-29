@@ -268,7 +268,7 @@ for (const failure of [
 
     await writeFile(join(h.cwd, "candidate.txt"), "next candidate\n");
     const nextRun = await h.call("run_experiment", benchmark);
-    assert.equal(nextRun.details.passed, true);
+    assert.equal(nextRun.details.passed, true, JSON.stringify(nextRun));
     assert.equal(nextRun.details.checksPass, true);
     const next = await h.call("log_experiment", { ...keep, metric: 1, description: "fresh benchmark keep" });
     assert.notEqual(next.isError, true);
