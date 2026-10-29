@@ -51,6 +51,7 @@ import {
   autoresearchSummaryPathsFor,
   buildAutoresearchCompactionSummary,
   CompactionSourceReadError,
+  CompactionLogFormatError,
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
@@ -1616,10 +1617,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return autoresearchCompactionFor(ctx, event);
     } catch (error) {
       // The host catches thrown extension errors and may continue with default
-      // compaction. Return explicit cancellation so failed source reads cannot
+      // compaction. Return explicit cancellation so failed source reads or invalid logs cannot
       // replace history with an incomplete summary or resume message.
       cancelPendingResume(runtime);
-      const detail = error instanceof CompactionSourceReadError
+      const detail = (error instanceof CompactionSourceReadError || error instanceof CompactionLogFormatError)
         ? error.message
         : "Unable to prepare persisted session sources. Repair them before retrying.";
       try {
