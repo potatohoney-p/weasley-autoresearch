@@ -30,6 +30,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 
 import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 
@@ -1854,6 +1855,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
         // Rolling buffer for tail truncation (keep 2x what we need)
         const chunks: Buffer[] = [];
+        const rawPrefix: Buffer[] = [];
+        const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
+        const ended = new Set<string>();
         let chunksBytes = 0;
         const maxChunksBytes = DEFAULT_MAX_BYTES * 2;
 
@@ -1910,7 +1914,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           } catch (error) { failOutput(error); }
         };
 
-        const handleData = (data: Buffer) => {
+        const handleData = (data: Buffer, pipe: "stdout" | "stderr") => {
           totalBytes += data.length;
 
           // Start writing to temp file once we exceed the threshold
@@ -1935,7 +1939,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
                   done();
                 });
               });
-              for (const chunk of chunks) writeOutput(chunk);
+              for (const chunk of rawPrefix) writeOutput(chunk);
+              rawPrefix.length = 0;
             } catch (error) {
               failOutput(error);
             }
@@ -1945,7 +1950,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             writeOutput(data);
           }
 
-          // Keep rolling buffer of recent data
+          if (!tempFilePath) rawPrefix.push(data);
+          appendText(decoders[pipe].write(data));
+        };
+
+        const appendText = (text: string) => {
+          if (!text) return;
+          const data = Buffer.from(text, "utf8");
+          // Each chunk contains whole decoded codepoints, never mixed pipe fragments.
           chunks.push(data);
           chunksBytes += data.length;
 
@@ -1969,8 +1981,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           chunksGeneration++;
         };
 
-        if (child.stdout) child.stdout.on("data", handleData);
-        if (child.stderr) child.stderr.on("data", handleData);
+        const endText = (pipe: "stdout" | "stderr") => {
+          if (ended.has(pipe)) return;
+          ended.add(pipe);
+          appendText(decoders[pipe].end());
+        };
+        child.stdout?.on("data", (data) => handleData(data, "stdout"));
+        child.stderr?.on("data", (data) => handleData(data, "stderr"));
+        child.stdout?.on("end", () => endText("stdout"));
+        child.stderr?.on("end", () => endText("stderr"));
 
         // Cancellation and output failure use bounded cleanup, not just a signal request.
         // Keep escalation alive even if the direct child exits first: descendants
@@ -1985,6 +2004,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const finish = async (error?: Error) => {
           if (finished) return;
           finished = true;
+          endText("stdout");
+          endText("stderr");
           const completedAt = Date.now();
           clearInterval(timerInterval);
           if (timeoutHandle) clearTimeout(timeoutHandle);

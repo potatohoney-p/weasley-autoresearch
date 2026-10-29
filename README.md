@@ -216,3 +216,13 @@ exceed the sink high-water mark; this is not a fixed process-memory or disk quot
 Slow storage can slow the benchmark and contribute to its timeout and measured
 duration. Final flush waiting remains excluded from the duration. Cancellation
 retains best-effort cleanup; storage that never completes can still delay finalization.
+
+Benchmark display output decodes UTF-8 independently for stdout and stderr, so an
+incomplete codepoint in one pipe is not corrupted by bytes from the other. Text
+is appended when decoded; this is not a global ordering guarantee between pipes.
+Incomplete UTF-8 at pipe closure is represented by the standard replacement
+character. The streamed artifact (above the full-output byte threshold) retains raw bytes
+in observed data-event order,
+so mixed-pipe raw files may not themselves form valid UTF-8. Smaller artifacts
+created only because the LLM display is truncated retain decoded display text. Display retention
+remains bounded and does not promise to retain every diagnostic line.
