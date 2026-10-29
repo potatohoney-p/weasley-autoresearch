@@ -13,6 +13,9 @@
     "url": "https://github.com/potatohoney-p/weasley-autoresearch/issues"
   },
   "type": "module",
+  "bin": {
+    "weasley-benchmark": "bin/repeat-benchmark.mjs"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -36,6 +39,7 @@
     ]
   },
   "files": [
+    "bin",
     "extensions",
     "skills",
     "assets",

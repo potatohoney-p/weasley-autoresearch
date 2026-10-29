@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept experiments are published only after a verified Git outcome and successful log append.
+  Git errors no longer become successful kept results; uncertain commit or persistence outcomes
+  pause the session for explicit reconciliation without retrying or rolling back user work.
+- Concurrent log calls and session mutations are rejected while logging is pending, and error
+  results render safely without assuming a successful experiment exists.
+- Preserve secondary metric names such as `__proto__` during JSONL recovery and use only
+  own metric values for dashboard and log-result baselines, avoiding inherited values and NaN deltas.
+
 ## [1.6.3] - 2026-08-02
 
 ### Added

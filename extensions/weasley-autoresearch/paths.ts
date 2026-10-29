@@ -48,11 +48,11 @@ function legacyHookPath(workDir: string, stage: HookStage): string {
   return path.join(workDir, LEGACY_HOOKS_DIR, `${stage}.sh`);
 }
 
-function currentLayoutExists(dir: string): boolean {
+function currentLayoutExists(dir: string, exists: (filePath: string) => boolean = fs.existsSync): boolean {
   for (const kind of Object.keys(SESSION_FILE_NAMES) as SessionFileKind[]) {
-    if (fs.existsSync(currentSessionPath(dir, kind))) return true;
+    if (exists(currentSessionPath(dir, kind))) return true;
   }
-  return fs.existsSync(path.join(dir, AUTO_DIR, CURRENT_HOOKS_DIR));
+  return exists(path.join(dir, AUTO_DIR, CURRENT_HOOKS_DIR));
 }
 
 /** Return both physical paths for destructive or migration operations. */
@@ -67,11 +67,17 @@ export function sessionFileCandidates(dir: string, kind: SessionFileKind): Sessi
  * Effective path for a session file. If any current `.auto/` session artifact
  * exists, stay in the current layout for every file and ignore stale legacy
  * peers. Fall back to a legacy flat file only when no current layout exists.
+ * A caller may supply a stricter presence probe; ordinary runtime callers keep
+ * the existing existsSync behavior.
  */
-export function sessionFilePath(dir: string, kind: SessionFileKind): string {
+export function sessionFilePath(
+  dir: string,
+  kind: SessionFileKind,
+  exists: (filePath: string) => boolean = fs.existsSync,
+): string {
   const candidates = sessionFileCandidates(dir, kind);
-  if (currentLayoutExists(dir)) return candidates.current;
-  return fs.existsSync(candidates.legacy) ? candidates.legacy : candidates.current;
+  if (currentLayoutExists(dir, exists)) return candidates.current;
+  return exists(candidates.legacy) ? candidates.legacy : candidates.current;
 }
 
 /** Effective path for a hook script, with the same layout choice as session files. */

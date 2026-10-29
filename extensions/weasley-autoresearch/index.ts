@@ -30,6 +30,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 
 import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 
@@ -49,9 +50,14 @@ import {
 import {
   autoresearchSummaryPathsFor,
   buildAutoresearchCompactionSummary,
+  CompactionSourceReadError,
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
+import { captureCandidateProvenance, resolveBenchmarkPath } from "./provenance.ts";
+import { benchmarkPathFromCommand } from "./benchmark-command.ts";
+import { commitKeptCandidate } from "./keep.ts";
+import { MetricCollector, metricLimitWarning, type MetricLimit } from "./metrics.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -119,13 +125,13 @@ type AutoResumeGuardRuntime = {
   state: AutoResumeGuardState;
 };
 
-/** Count trailing discard/crash results in the current segment. */
+/** Count trailing rejected results, including correctness failures, in this segment. */
 export function countConsecutiveDiscardOrCrashResults(state: AutoResumeGuardState): number {
   let count = 0;
   for (let i = state.results.length - 1; i >= 0; i--) {
     const result = state.results[i];
     if (result.segment !== state.currentSegment) break;
-    if (result.status === "discard" || result.status === "crash") {
+    if (result.status === "discard" || result.status === "crash" || result.status === "checks_failed") {
       count++;
       continue;
     }
@@ -140,7 +146,7 @@ export function autoResumeStopReasonFor(runtime: AutoResumeGuardRuntime): string
   }
   const failures = countConsecutiveDiscardOrCrashResults(runtime.state);
   if (failures > CONSECUTIVE_FAILURE_OVERRIDE_LIMIT) {
-    return `Autoresearch auto-resume stopped — ${failures} consecutive discards/crashes`;
+    return `Autoresearch auto-resume stopped — ${failures} consecutive discards/crashes/checks failures`;
   }
   return null;
 }
@@ -158,8 +164,12 @@ interface RunDetails {
   checksTimedOut: boolean;
   checksOutput: string;
   checksDuration: number;
+  /** Optional synchronous progress delivery failed; execution results remain authoritative. */
+  progressUpdateFailed?: boolean;
   /** Metrics parsed from METRIC lines in output. null if none found. */
   parsedMetrics: Record<string, number> | null;
+  /** Resource limits reached while collecting structured metrics. */
+  metricLimits: MetricLimit[];
   /** Primary metric value extracted from parsedMetrics (matching metricName). null if not found. */
   parsedPrimary: number | null;
   /** Name of the primary metric (for display) */
@@ -176,8 +186,24 @@ interface LogDetails {
 
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
+  /** In-process serialization only; other sessions and external writers are not locked. */
+  logInProgress: boolean;
+  /** Explicit command-level reconciliation/resume is required after an uncertain keep. */
+  keepReconciliationRequired: boolean;
   experimentsThisSession: number;
   autoResumeTurns: number;
+  /** Revokes pending benchmark/check completions when evidence is invalidated. */
+  runGeneration: number;
+  /** Only the latest attempted run in this runtime may authorize a keep. */
+  lastRunBenchmark: {
+    passed: boolean;
+    /** Observed primary value, copied independently of returned tool details. */
+    primaryMetric: number | null;
+    workDir: string;
+    candidateDigest: string;
+    invokedBenchmark: string | null;
+    provenanceError: string | null;
+  } | null;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
   lastRunDuration: number | null;
   runningExperiment: { startedAt: number; command: string } | null;
@@ -192,6 +218,17 @@ interface AutoresearchRuntime {
 // Tool Schemas
 // ---------------------------------------------------------------------------
 
+const MAX_TIMEOUT_SECONDS = 2_147_483_647 / 1000;
+
+// Node timers clamp overflowing delays to 1 ms. Validate before launching work.
+function timeoutMilliseconds(value: unknown, fallback: number, name: string): number {
+  const seconds = value === undefined ? fallback : value;
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0 || seconds > MAX_TIMEOUT_SECONDS) {
+    throw new Error(`Invalid ${name}: expected a finite number from 0 to ${MAX_TIMEOUT_SECONDS} seconds (0 disables the timeout).`);
+  }
+  return seconds === 0 ? 0 : Math.max(1, Math.floor(seconds * 1000));
+}
+
 const RunParams = Type.Object({
   command: Type.String({
     description:
@@ -199,13 +236,17 @@ const RunParams = Type.Object({
   }),
   timeout_seconds: Type.Optional(
     Type.Number({
-      description: "Kill after this many seconds (default: 600)",
+      description: "Kill after this many seconds (default: 600; 0 disables timeout)",
+      minimum: 0,
+      maximum: MAX_TIMEOUT_SECONDS,
     })
   ),
   checks_timeout_seconds: Type.Optional(
     Type.Number({
       description:
-        "Kill .auto/checks.sh after this many seconds (default: 300). Only relevant when the checks file exists.",
+        "Kill .auto/checks.sh after this many seconds (default: 300; 0 disables timeout). Validated even when checks are absent.",
+      minimum: 0,
+      maximum: MAX_TIMEOUT_SECONDS,
     })
   ),
 });
@@ -269,39 +310,6 @@ export const LogParams = Type.Object({
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Prefix for structured metric output lines: `METRIC name=value` */
-const METRIC_LINE_PREFIX = "METRIC";
-
-/**
- * Parse structured METRIC lines from command output.
- * Format: METRIC name=value (one per line)
- * Example:
- *   METRIC total_µs=15200
- *   METRIC compile_µs=4200
- *
- * Names must be word chars, dots, or µ (rejects `=` and other specials).
- * Values must be finite numbers (rejects Infinity, NaN, hex, etc.).
- * Duplicate names: last occurrence wins (allows scripts to refine values).
- * Returns a Map preserving insertion order of first occurrence per key.
- */
-/** Metric names that could cause prototype pollution if used as object keys */
-const DENIED_METRIC_NAMES = new Set(["__proto__", "constructor", "prototype"]);
-
-function parseMetricLines(output: string): Map<string, number> {
-  const metrics = new Map<string, number>();
-  const regex = new RegExp(`^${METRIC_LINE_PREFIX}\\s+([\\w.µ]+)=(\\S+)\\s*$`, "gm");
-  let match;
-  while ((match = regex.exec(output)) !== null) {
-    const name = match[1];
-    if (DENIED_METRIC_NAMES.has(name)) continue;
-    const value = Number(match[2]);
-    if (Number.isFinite(value)) {
-      metrics.set(name, value);
-    }
-  }
-  return metrics;
-}
-
 /** Format a number with comma-separated thousands: 15586 → "15,586" */
 function commas(n: number): string {
   const s = String(Math.round(n));
@@ -353,45 +361,17 @@ function formatElapsed(ms: number): string {
 }
 
 /** Kill a process tree (best effort, tries process group first) */
-function killTree(pid: number): void {
+function killTree(pid: number, signal: NodeJS.Signals = "SIGTERM", allowDirectFallback = true): void {
   try {
-    process.kill(-pid, "SIGTERM");
+    process.kill(-pid, signal);
   } catch {
+    if (!allowDirectFallback) return;
     try {
-      process.kill(pid, "SIGTERM");
+      process.kill(pid, signal);
     } catch {
       // Process may have already exited
     }
   }
-}
-
-/**
- * Check if a command's primary purpose is running the benchmark script.
- *
- * Strategy: strip common harmless prefixes (env vars, env/time/nice wrappers)
- * then check that the core command is the benchmark script invoked via a known
- * pattern. Rejects chaining tricks like "evil.py; measure.sh" because we require
- * the benchmark script to be the *first* real command.
- */
-function isAutoresearchShCommand(command: string): boolean {
-  let cmd = command.trim();
-
-  // Strip leading env variable assignments: FOO=bar BAZ="qux" ...
-  cmd = cmd.replace(/^(?:\w+=\S*\s+)+/, "");
-
-  // Strip known harmless command wrappers (env, time, nice, nohup) repeatedly
-  // Allows flags and their numeric values: e.g. "nice -n 10 time env ..."
-  let prev: string;
-  do {
-    prev = cmd;
-    cmd = cmd.replace(/^(?:env|time|nice|nohup)(?:\s+-\S+(?:\s+\d+)?)*\s+/, "");
-  } while (cmd !== prev);
-
-  // Now the core command must be the benchmark script via a known invocation.
-  // Current layout requires the `.auto/measure.sh` path; legacy `autoresearch.sh`
-  // is still accepted for in-flight sessions. An optional path prefix allows
-  //   ./.auto/measure.sh, /abs/path/.auto/measure.sh, bash [-flags] autoresearch.sh, etc.
-  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\/|\.{1,2}\/|[\w.-]+\/)*(?:autoresearch\.sh|\.auto\/measure\.sh)(?:\s|$)/.test(cmd);
 }
 
 function isBetter(
@@ -679,6 +659,11 @@ function findBaselineRunNumber(results: ExperimentResult[], segment: number): nu
   return index >= 0 ? index + 1 : null;
 }
 
+/** Metric names are user data, including names inherited from Object.prototype. */
+function ownMetric(metrics: Record<string, number>, name: string): number | undefined {
+  return Object.hasOwn(metrics, name) ? metrics[name] : undefined;
+}
+
 /**
  * Find secondary metric baselines from the first experiment in current segment.
  * For metrics that didn't exist at baseline time, falls back to the first
@@ -697,11 +682,13 @@ function findBaselineSecondary(
   // Fill in any known metrics missing from baseline with their first occurrence
   if (knownMetrics) {
     for (const sm of knownMetrics) {
-      if (base[sm.name] === undefined) {
+      if (ownMetric(base, sm.name) === undefined) {
         for (const r of cur) {
-          const val = (r.metrics ?? {})[sm.name];
+          const val = ownMetric(r.metrics ?? {}, sm.name);
           if (val !== undefined) {
-            base[sm.name] = val;
+            Object.defineProperty(base, sm.name, {
+              value: val, enumerable: true, writable: true, configurable: true,
+            });
             break;
           }
         }
@@ -794,8 +781,12 @@ function createExperimentState(): ExperimentState {
 function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
+    logInProgress: false,
+    keepReconciliationRequired: false,
     experimentsThisSession: 0,
     autoResumeTurns: 0,
+    runGeneration: 0,
+    lastRunBenchmark: null,
     lastRunChecks: null,
     lastRunDuration: null,
     runningExperiment: null,
@@ -803,6 +794,14 @@ function createSessionRuntime(): AutoresearchRuntime {
     pendingResumeTimer: null,
     pendingResumeMessage: null,
   };
+}
+
+function invalidateRunEvidence(runtime: AutoresearchRuntime): void {
+  runtime.runGeneration++;
+  runtime.lastRunBenchmark = null;
+  runtime.lastRunChecks = null;
+  runtime.lastRunDuration = null;
+  runtime.runningExperiment = null;
 }
 
 function createRuntimeStore() {
@@ -923,8 +922,8 @@ function renderDashboardLines(
       // Build individually-colored parts
       const secParts: string[] = [];
       for (const sm of st.secondaryMetrics) {
-        const val = bestSecondary[sm.name];
-        const bv = baselineSec[sm.name];
+        const val = ownMetric(bestSecondary, sm.name);
+        const bv = ownMetric(baselineSec, sm.name);
         if (val !== undefined) {
           let part = th.fg("muted", `${sm.name}: ${formatNum(val, sm.unit)}`);
           if (bv !== undefined && bv !== 0 && val !== bv) {
@@ -969,7 +968,7 @@ function renderDashboardLines(
 
   // Only show secondary metric columns that have at least one value in rendered rows
   const secMetrics = st.secondaryMetrics.filter((sm) =>
-    rowsToRender.some((r) => (r.metrics ?? {})[sm.name] !== undefined)
+    rowsToRender.some((r) => ownMetric(r.metrics ?? {}, sm.name) !== undefined)
   );
 
   // Column definitions
@@ -984,7 +983,7 @@ function renderDashboardLines(
   const secColWidths: number[] = secMetrics.map((sm) => {
     let maxW = visibleWidth(sm.name);
     for (const r of rowsToRender) {
-      const val = (r.metrics ?? {})[sm.name];
+      const val = ownMetric(r.metrics ?? {}, sm.name);
       if (val !== undefined) {
         maxW = Math.max(maxW, visibleWidth(formatNum(val, sm.unit)));
       }
@@ -1101,12 +1100,12 @@ function renderDashboardLines(
     for (let si = 0; si < visibleSecMetrics.length; si++) {
       const sm = visibleSecMetrics[si];
       const colW = secColWidths[si];
-      const val = rowMetrics[sm.name];
+      const val = ownMetric(rowMetrics, sm.name);
       if (val !== undefined) {
         const secStr = formatNum(val, sm.unit);
         let secColor: Parameters<typeof th.fg>[0] = "dim";
         if (!isOld) {
-          const bv = baselineSecondary[sm.name];
+          const bv = ownMetric(baselineSecondary, sm.name);
           if (isBaseline) {
             secColor = "text";
           } else if (bv !== undefined && bv !== 0) {
@@ -1195,6 +1194,39 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const cancelPendingResume = (runtime: AutoresearchRuntime): void => {
     pausePendingResume(runtime);
     runtime.pendingResumeMessage = null;
+  };
+
+  const logBusyResult = () => ({
+    content: [{ type: "text" as const, text: "An experiment log operation is in progress. Wait for its outcome before changing the session or running another experiment." }],
+    details: {},
+    isError: true,
+  });
+
+  const reconciliationResult = () => ({
+    content: [{ type: "text" as const, text: "A previous experiment operation has an uncertain Git or log outcome. Inspect HEAD, the index and the session log and reconcile them, then explicitly resume with /autoresearch <goal>. Automatic retries are blocked." }],
+    details: {},
+    isError: true,
+  });
+
+  const pauseUncertainKeep = (ctx: ExtensionContext, workDir: string): string => {
+    const runtime = getRuntime(ctx);
+    // Stop automatic continuation even if persisting the OFF record or aborting fails.
+    runtime.autoresearchMode = false;
+    runtime.keepReconciliationRequired = true;
+    cancelPendingResume(runtime);
+    runtime.lastRunChecks = null;
+    runtime.lastRunDuration = null;
+    runtime.runningExperiment = null;
+    const warnings: string[] = [];
+    for (const [label, action] of [
+      ["disable tools", () => setAutoresearchMode(ctx, false)],
+      ["persist session pause", () => recordAutoresearchActivation(workDir, false)],
+      ["abort current loop", () => ctx.abort()],
+    ] as const) {
+      try { action(); }
+      catch (error) { warnings.push(`Could not ${label}: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    return warnings.length ? `\n${warnings.join("\n")}` : "";
   };
 
   const markAutoResumeSent = (runtime: AutoresearchRuntime): void => {
@@ -1372,9 +1404,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const reconstructState = (ctx: ExtensionContext) => {
     const runtime = getRuntime(ctx);
     cancelPendingResume(runtime);
-    runtime.lastRunChecks = null;
-    runtime.lastRunDuration = null;
-    runtime.runningExperiment = null;
+    invalidateRunEvidence(runtime);
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
     runtime.state = createExperimentState();
@@ -1409,8 +1439,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }));
         state.secondaryMetrics = reconstructed.secondaryMetrics.map((metric) => ({ ...metric }));
 
+        // A successfully read log is authoritative even before its first result.
+        // Falling back here would resurrect history from a cleared session.
+        loadedFromJsonl = true;
         if (state.results.length > 0) {
-          loadedFromJsonl = true;
           state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
           state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
         }
@@ -1540,10 +1572,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_tree", async (_e, ctx) => reconstructState(ctx));
-  pi.on("session_before_switch", async () => {
+  pi.on("session_before_switch", async (_e, ctx) => {
+    invalidateRunEvidence(getRuntime(ctx));
     clearOverlay();
   });
   pi.on("session_shutdown", async (_e, ctx) => {
+    invalidateRunEvidence(getRuntime(ctx));
     clearSessionUi(ctx);
     cancelPendingResume(getRuntime(ctx));
     runtimeStore.clear(getSessionKey(ctx));
@@ -1576,8 +1610,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   pi.on("session_before_compact", async (event, ctx) => {
-    pausePendingResume(getRuntime(ctx));
-    return autoresearchCompactionFor(ctx, event);
+    const runtime = getRuntime(ctx);
+    pausePendingResume(runtime);
+    try {
+      return autoresearchCompactionFor(ctx, event);
+    } catch (error) {
+      // The host catches thrown extension errors and may continue with default
+      // compaction. Return explicit cancellation so failed source reads cannot
+      // replace history with an incomplete summary or resume message.
+      cancelPendingResume(runtime);
+      const detail = error instanceof CompactionSourceReadError
+        ? error.message
+        : "Unable to prepare persisted session sources. Repair them before retrying.";
+      try {
+        ctx.ui.notify(`Autoresearch compaction canceled: ${detail}`, "error");
+      } catch {
+        // Notification delivery must not suppress the cancellation contract.
+      }
+      return { cancel: true };
+    }
   });
 
   pi.on("session_compact", async (_event, ctx) => {
@@ -1653,6 +1704,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
+      if (runtime.logInProgress) return logBusyResult();
+      if (runtime.keepReconciliationRequired) return reconciliationResult();
       const state = runtime.state;
 
       // Validate working directory exists
@@ -1665,24 +1718,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const isReinit = state.results.length > 0;
-
-      state.name = params.name;
-      state.metricName = params.metric_name;
-      state.metricUnit = params.metric_unit ?? "";
-      if (params.direction === "lower" || params.direction === "higher") {
-        state.bestDirection = params.direction;
-      }
-      // Start a new segment — keep history for dashboard, but reset baseline tracking.
-      // Old results remain accessible (filtered by segment in rendering).
-      if (isReinit) {
-        state.currentSegment++;
-      }
-      state.bestMetric = null;
-      state.secondaryMetrics = [];
-      state.confidence = null;
-
-      // Read max experiments from config file (config always in ctx.cwd)
-      state.maxExperiments = readMaxExperiments(ctx.cwd);
+      invalidateRunEvidence(runtime);
+      // Keep the currently published goal/baseline intact until its replacement
+      // is persisted. A failed append may have written bytes, so it must pause
+      // through the same explicit reconciliation gate as an uncertain keep.
+      const nextState = {
+        ...state,
+        name: params.name,
+        metricName: params.metric_name,
+        metricUnit: params.metric_unit ?? "",
+        bestDirection: params.direction === "lower" || params.direction === "higher"
+          ? params.direction : state.bestDirection,
+        currentSegment: state.currentSegment + (isReinit ? 1 : 0),
+        bestMetric: null,
+        secondaryMetrics: [],
+        confidence: null,
+        maxExperiments: readMaxExperiments(ctx.cwd),
+      };
 
       // Write config header to jsonl (append for re-init, create for first)
       const workDir = resolveWorkDir(ctx.cwd);
@@ -1691,26 +1743,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ensureParentDir(jsonlPath);
         const config = JSON.stringify({
           type: "config",
-          name: state.name,
-          metricName: state.metricName,
-          metricUnit: state.metricUnit,
-          bestDirection: state.bestDirection,
+          name: nextState.name,
+          metricName: nextState.metricName,
+          metricUnit: nextState.metricUnit,
+          bestDirection: nextState.bestDirection,
         });
         if (fs.existsSync(jsonlPath)) {
           fs.appendFileSync(jsonlPath, config + "\n");
         } else {
           fs.writeFileSync(jsonlPath, config + "\n");
         }
-        broadcastDashboardUpdate(workDir);
       } catch (e) {
+        const pauseWarnings = pauseUncertainKeep(ctx, workDir);
         return {
           content: [{
             type: "text",
-            text: `⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`,
+            text: `❌ Experiment initialization persistence is uncertain: ${e instanceof Error ? e.message : String(e)}\nThe previous in-memory goal and baseline are unchanged. The config write may have partially or completely succeeded. Autoresearch is paused. Inspect and reconcile .auto/log.jsonl, then explicitly resume. Do not automatically retry initialization.${pauseWarnings}`,
           }],
-          details: {},
+          details: { state: cloneExperimentState(state) },
+          isError: true,
         };
       }
+
+      Object.assign(state, nextState);
+      broadcastDashboardUpdate(workDir);
 
       const wasInactive = !runtime.autoresearchMode;
       recordAutoresearchActivation(workDir, true);
@@ -1773,7 +1829,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const runtime = getRuntime(ctx);
+      if (runtime.logInProgress) return logBusyResult();
+      if (runtime.keepReconciliationRequired) return reconciliationResult();
       const state = runtime.state;
+
+      // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
+      // Every attempted run supersedes prior evidence, including a rejected
+      // invocation. Never let a validation failure revive an earlier success.
+      invalidateRunEvidence(runtime);
+      const runGeneration = runtime.runGeneration;
+      const assertCurrentRun = () => {
+        if (runtime.runGeneration !== runGeneration) {
+          throw new Error("Experiment run superseded by another attempt or session change; its evidence was not published.");
+        }
+        if (signal?.aborted) {
+          invalidateRunEvidence(runtime);
+          throw new Error("aborted");
+        }
+      };
+      assertCurrentRun();
 
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
@@ -1796,16 +1870,29 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      const timeout = (params.timeout_seconds ?? 600) * 1000;
+      let timeout: number;
+      let checksTimeout: number;
+      try {
+        timeout = timeoutMilliseconds(params.timeout_seconds, 600, "timeout_seconds");
+        checksTimeout = timeoutMilliseconds(params.checks_timeout_seconds, 300, "checks_timeout_seconds");
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `❌ ${(error as Error).message}` }],
+          details: {},
+        };
+      }
 
-      // Guard: if the benchmark script exists, only allow running it
+      // Guard: if the benchmark script exists, require a complete supported
+      // invocation, not merely a prefix whose shell status could hide failure.
       const autoresearchShPath = autoresearchScriptPath(workDir);
       const benchmarkScriptRel = path.relative(workDir, autoresearchShPath) || path.basename(autoresearchShPath);
-      if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
+      const benchmarkCommandPath = benchmarkPathFromCommand(params.command);
+      if (fs.existsSync(autoresearchShPath) && !benchmarkCommandPath) {
         return {
           content: [{
             type: "text",
-            text: `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash ${benchmarkScriptRel}" }) or run_experiment({ command: "./${benchmarkScriptRel}" })`,
+            text: `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse a supported literal invocation such as run_experiment({ command: "bash ${benchmarkScriptRel}" }). Literal script arguments, quoted paths, and basic env/time/nice/nohup wrappers are supported. Put pipelines, redirection, chaining, expansion, or complex setup inside the benchmark script and propagate failures; syntax-only/help shell modes are not supported.`,
           }],
           details: {
             command: params.command,
@@ -1823,21 +1910,38 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      let candidateDigest: string;
+      let invokedBenchmark: string | null;
+      try {
+        invokedBenchmark = resolveBenchmarkPath(workDir, benchmarkCommandPath);
+        candidateDigest = captureCandidateProvenance(workDir, invokedBenchmark);
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `❌ Cannot run_experiment — cannot capture candidate provenance: ${error instanceof Error ? error.message : String(error)}. Fix the unsupported or unreadable input, then rerun.` }],
+          details: {},
+        };
+      }
+      // Do not launch already-cancelled work, even briefly.
+      if (signal?.aborted) throw new Error("aborted");
+
       // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
 
       const t0 = Date.now();
+      let progressUpdateFailed = false;
 
       // Spawn the process directly (like the bash tool) for streaming output
       const getTempFile = createTempFileAllocator();
-      const { exitCode, killed: timedOut, output, tempFilePath: streamTempFile, actualTotalBytes } = await new Promise<{
+      const metricCollector = new MetricCollector();
+      const { exitCode, killed: timedOut, output, tempFilePath: streamTempFile, actualTotalBytes, completedAt } = await new Promise<{
         exitCode: number | null;
         killed: boolean;
         output: string;
         tempFilePath: string | undefined;
         actualTotalBytes: number;
+        completedAt: number;
       }>((resolve, reject) => {
         let processTimedOut = false;
 
@@ -1849,6 +1953,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
         // Rolling buffer for tail truncation (keep 2x what we need)
         const chunks: Buffer[] = [];
+        const rawPrefix: Buffer[] = [];
+        const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
+        const ended = new Set<string>();
         let chunksBytes = 0;
         const maxChunksBytes = DEFAULT_MAX_BYTES * 2;
 
@@ -1856,6 +1963,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         let tempFilePath: string | undefined;
         let tempFileStream: ReturnType<typeof createWriteStream> | undefined;
         let totalBytes = 0;
+        let outputError: Error | undefined;
+        let outputFinished: Promise<void> | undefined;
+        const failOutput = (error: unknown): void => {
+          outputError ??= error instanceof Error ? error : new Error(String(error));
+          stop();
+        };
 
         // Cache for Buffer.concat — only rebuild when chunks change
         let chunksGeneration = 0;
@@ -1871,40 +1984,86 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
         // Timer interval — update every second with elapsed time + tail output
         const timerInterval = setInterval(() => {
-          if (!onUpdate) return;
+          if (!onUpdate || progressUpdateFailed) return;
           const elapsed = formatElapsed(Date.now() - t0);
           const trunc = truncateTail(getBufferText(), {
             maxLines: DEFAULT_MAX_LINES,
             maxBytes: DEFAULT_MAX_BYTES,
           });
-          onUpdate({
-            content: [{ type: "text", text: trunc.content || "" }],
-            details: {
-              phase: "running",
-              elapsed,
-              truncation: trunc.truncated ? trunc : undefined,
-              fullOutputPath: tempFilePath,
-            },
-          });
+          try {
+            onUpdate({
+              content: [{ type: "text", text: trunc.content || "" }],
+              details: {
+                phase: "running",
+                elapsed,
+                truncation: trunc.truncated ? trunc : undefined,
+                fullOutputPath: tempFilePath,
+              },
+            });
+          } catch {
+            // The host progress callback is optional and synchronous. Do not let a
+            // display failure escape this timer and terminate the host process.
+            // Disable only this run's observer; never replay the benchmark.
+            progressUpdateFailed = true;
+          }
         }, 1000);
 
-        const handleData = (data: Buffer) => {
+        // Both readable pipes feed one sink. Pause both when it asks for pressure;
+        // otherwise stderr can continue filling the same queue while stdout waits.
+        const writeOutput = (data: Buffer): void => {
+          try {
+            if (tempFileStream && !tempFileStream.write(data)) {
+              child.stdout?.pause();
+              child.stderr?.pause();
+            }
+          } catch (error) { failOutput(error); }
+        };
+
+        const handleData = (data: Buffer, pipe: "stdout" | "stderr") => {
+          metricCollector.write(pipe, data);
           totalBytes += data.length;
 
           // Start writing to temp file once we exceed the threshold
           if (totalBytes > DEFAULT_MAX_BYTES && !tempFilePath) {
-            tempFilePath = getTempFile();
-            tempFileStream = createWriteStream(tempFilePath);
-            for (const chunk of chunks) {
-              tempFileStream.write(chunk);
+            try {
+              tempFilePath = getTempFile();
+              tempFileStream = createWriteStream(tempFilePath);
+              const stream = tempFileStream;
+              stream.on("drain", () => {
+                if (!outputError && !finished) {
+                  child.stdout?.resume();
+                  child.stderr?.resume();
+                }
+              });
+              // Observe failures immediately, but settle only after child cleanup.
+              // Resolve on error too so there is no unhandled rejected promise.
+              outputFinished = new Promise<void>((done) => {
+                stream.once("error", (error) => { failOutput(error); done(); });
+                stream.once("finish", done);
+                stream.once("close", () => {
+                  if (!stream.writableFinished && !outputError) failOutput(new Error("Output stream closed before finishing"));
+                  done();
+                });
+              });
+              for (const chunk of rawPrefix) writeOutput(chunk);
+              rawPrefix.length = 0;
+            } catch (error) {
+              failOutput(error);
             }
           }
 
-          if (tempFileStream) {
-            tempFileStream.write(data);
+          if (tempFileStream && !outputError) {
+            writeOutput(data);
           }
 
-          // Keep rolling buffer of recent data
+          if (!tempFilePath) rawPrefix.push(data);
+          appendText(decoders[pipe].write(data));
+        };
+
+        const appendText = (text: string) => {
+          if (!text) return;
+          const data = Buffer.from(text, "utf8");
+          // Each chunk contains whole decoded codepoints, never mixed pipe fragments.
           chunks.push(data);
           chunksBytes += data.length;
 
@@ -1928,74 +2087,100 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           chunksGeneration++;
         };
 
-        if (child.stdout) child.stdout.on("data", handleData);
-        if (child.stderr) child.stderr.on("data", handleData);
-
-        // Timeout
-        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-        if (timeout > 0) {
-          timeoutHandle = setTimeout(() => {
-            processTimedOut = true;
-            if (child.pid) killTree(child.pid);
-          }, timeout);
-        }
-
-        // Abort signal — kill immediately if pid exists, otherwise queue for spawn.
-        // Using child.kill() as fallback ensures the signal is never silently swallowed.
-        const onAbort = () => {
-          if (child.pid) killTree(child.pid);
-          else {
-            // pid not yet assigned — try child.kill() which works without pid,
-            // and also queue killTree for spawn in case child.kill() isn't enough
-            // to clean up the full process tree.
-            child.kill();
-            child.once("spawn", () => { if (child.pid) killTree(child.pid); });
-          }
+        const endText = (pipe: "stdout" | "stderr") => {
+          if (ended.has(pipe)) return;
+          ended.add(pipe);
+          appendText(decoders[pipe].end());
+          metricCollector.end(pipe);
         };
-        if (signal) {
-          if (signal.aborted) {
-            onAbort();
-          } else {
-            signal.addEventListener("abort", onAbort, { once: true });
+        child.stdout?.on("data", (data) => handleData(data, "stdout"));
+        child.stderr?.on("data", (data) => handleData(data, "stderr"));
+        child.stdout?.on("end", () => endText("stdout"));
+        child.stderr?.on("end", () => endText("stderr"));
+
+        // Cancellation is a bounded cleanup phase, not just a signal request.
+        // Keep escalation alive even if the direct child exits first: descendants
+        // in its process group can still be running or retaining output pipes.
+        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+        let escalationHandle: ReturnType<typeof setTimeout> | undefined;
+        let stopping = false;
+        let finished = false;
+        let observedExitCode: number | null = null;
+        let childExited = false;
+
+        const finish = async (error?: Error) => {
+          if (finished) return;
+          finished = true;
+          endText("stdout");
+          endText("stderr");
+          const completedAt = Date.now();
+          clearInterval(timerInterval);
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+          if (escalationHandle) clearTimeout(escalationHandle);
+          if (signal) signal.removeEventListener("abort", onAbort);
+          if (tempFileStream) tempFileStream.end();
+          if (outputFinished) await outputFinished;
+          if (outputError) {
+            reject(new Error(`Failed to persist benchmark output: ${outputError.message}`));
+            return;
           }
-        }
-
-        child.on("error", (err) => {
-          clearInterval(timerInterval);
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          if (signal) signal.removeEventListener("abort", onAbort);
-          if (tempFileStream) tempFileStream.end();
-          reject(err);
-        });
-
-        child.on("close", (code) => {
-          clearInterval(timerInterval);
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          if (signal) signal.removeEventListener("abort", onAbort);
-          if (tempFileStream) tempFileStream.end();
-
-          if (signal?.aborted) {
-            reject(new Error("aborted"));
+          if (error || signal?.aborted) {
+            reject(error ?? new Error("aborted"));
             return;
           }
 
-          const fullBuffer = Buffer.concat(chunks);
+          metricCollector.end("stdout");
+          metricCollector.end("stderr");
           resolve({
-            exitCode: code,
+            exitCode: observedExitCode,
             killed: processTimedOut,
-            output: fullBuffer.toString("utf-8"),
+            output: Buffer.concat(chunks).toString("utf-8"),
             tempFilePath,
             actualTotalBytes: totalBytes,
+            completedAt,
           });
+        };
+        const stop = () => {
+          if (stopping || finished) return;
+          stopping = true;
+          if (timeoutHandle) clearTimeout(timeoutHandle);
+          if (child.pid) killTree(child.pid, "SIGTERM", !childExited);
+          else child.once("spawn", () => { if (child.pid) killTree(child.pid); });
+          escalationHandle = setTimeout(() => {
+            if (child.pid) killTree(child.pid, "SIGKILL", !childExited);
+            // An escaped descendant may retain inherited pipes indefinitely.
+            // Release only our handles; do not claim those jobs were terminated.
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+            child.unref();
+            finish();
+          }, 250);
+        };
+        const onAbort = () => stop();
+        child.on("exit", (code) => { childExited = true; observedExitCode = code; });
+        child.on("error", (err) => finish(err));
+        child.on("close", (code) => {
+          observedExitCode = code;
+          if (!stopping) finish();
         });
+        if (timeout > 0) {
+          timeoutHandle = setTimeout(() => {
+            processTimedOut = true;
+            stop();
+          }, timeout);
+        }
+        if (signal?.aborted) onAbort();
+        else signal?.addEventListener("abort", onAbort, { once: true });
       }).finally(() => {
-        runtime.runningExperiment = null;
-        updateWidget(ctx);
-        if (overlayTui) overlayTui.requestRender();
+        if (runtime.runGeneration === runGeneration) {
+          runtime.runningExperiment = null;
+          updateWidget(ctx);
+          if (overlayTui) overlayTui.requestRender();
+        }
       });
 
-      const durationSeconds = (Date.now() - t0) / 1000;
-      runtime.lastRunDuration = durationSeconds;
+      assertCurrentRun();
+      const durationSeconds = (completedAt - t0) / 1000;
       const benchmarkPassed = exitCode === 0 && !timedOut;
 
       // Run backpressure checks if benchmark passed and checks file exists
@@ -2006,7 +2191,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const checksPath = autoresearchChecksPath(workDir);
       if (benchmarkPassed && fs.existsSync(checksPath)) {
-        const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
         const ct0 = Date.now();
         try {
           const checksResult = await pi.exec("bash", [checksPath], {
@@ -2025,10 +2209,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      // Store checks result for log_experiment gate
-      runtime.lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
-
-      const passed = benchmarkPassed && (checksPass === null || checksPass);
+      assertCurrentRun();
+      // Snapshot work stays outside benchmark/check duration measurements.
+      let provenanceError: string | null = null;
+      if (benchmarkPassed && checksPass !== false) {
+        try {
+          if (captureCandidateProvenance(workDir, invokedBenchmark) !== candidateDigest) {
+            provenanceError = "candidate or benchmark/check inputs changed during the benchmark or correctness checks";
+          }
+        } catch (error) {
+          provenanceError = `cannot verify candidate provenance: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+      const passed = benchmarkPassed && (checksPass === null || checksPass) && !provenanceError;
 
       // Reuse streaming temp file if it exists, otherwise create one for large output
       let fullOutputPath: string | undefined = streamTempFile;
@@ -2050,8 +2243,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         maxBytes: EXPERIMENT_MAX_BYTES,
       });
 
-      // Parse structured METRIC lines from output
-      const parsedMetricMap = parseMetricLines(output);
+      // Collected before display eviction; each pipe has its own line decoder.
+      const { values: parsedMetricMap, limits: metricLimits } = metricCollector.snapshot();
       const parsedMetrics = parsedMetricMap.size > 0
         ? Object.fromEntries(parsedMetricMap)
         : null;
@@ -2069,7 +2262,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         checksTimedOut,
         checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
         checksDuration,
+        ...(progressUpdateFailed ? { progressUpdateFailed: true } : {}),
         parsedMetrics,
+        metricLimits,
         parsedPrimary,
         metricName: state.metricName,
         metricUnit: state.metricUnit,
@@ -2089,6 +2284,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
         text += `💥 CHECKS FAILED (.auto/checks.sh) in ${checksDuration.toFixed(1)}s\n`;
         text += `Log this as 'checks_failed' — the benchmark metric is valid but correctness checks did not pass.\n`;
+      } else if (provenanceError) {
+        text += `⚠️ Benchmark completed, but ${provenanceError}.\n`;
+        text += "Cannot keep this result. Generate nonignored outputs before benchmarking or ignore disposable build artifacts, then rerun the benchmark.\n";
       } else {
         text += `✅ PASSED in ${durationSeconds.toFixed(1)}s\n`;
         if (checksPass === true) {
@@ -2096,9 +2294,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      if (progressUpdateFailed) {
+        text += "⚠ Progress updates stopped after a callback failure; benchmark and checks results are unchanged.\n";
+      }
+
       if (state.bestMetric !== null) {
         text += `📊 Current best ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}\n`;
       }
+
+      if (metricLimits.length) text += `⚠️ ${metricLimitWarning(metricLimits)}\n`;
 
       // Show parsed METRIC lines to the LLM
       if (parsedMetrics) {
@@ -2138,6 +2342,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
       }
 
+      // Publish only after the current call has finished preparing its result.
+      // Late completions must not revive evidence invalidated while awaiting.
+      assertCurrentRun();
+      runtime.lastRunBenchmark = { passed: benchmarkPassed, primaryMetric: parsedPrimary, workDir, candidateDigest, invokedBenchmark, provenanceError };
+      runtime.lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
+      runtime.lastRunDuration = durationSeconds;
       return {
         content: [{ type: "text", text }],
         details: { ...details, truncation: llmTruncation.truncated ? llmTruncation : undefined, fullOutputPath },
@@ -2178,13 +2388,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const d = result.details as (RunDetails & { truncation?: any; fullOutputPath?: string }) | undefined;
-      if (!d) {
+      if (!d || typeof d.durationSeconds !== "number") {
         const t = result.content[0];
         return new Text(t?.type === "text" ? t.text : "", 0, 0);
       }
 
       // Helper: append tail output preview or full output
       const appendOutput = (text: string, output: string): string => {
+        const warning = metricLimitWarning(d.metricLimits ?? []);
+        if (warning) text += "\n" + theme.fg("warning", warning);
         if (!output) return text;
         const lines = output.split("\n");
         if (expanded) {
@@ -2291,282 +2503,371 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
-      const state = runtime.state;
+      if (runtime.logInProgress) return logBusyResult();
+      if (runtime.keepReconciliationRequired) return reconciliationResult();
+      runtime.logInProgress = true;
+      try {
+        // A keep is published only after its Git outcome and log append succeed.
+        const state = params.status === "keep" ? cloneExperimentState(runtime.state) : runtime.state;
 
-      // Validate working directory exists
-      const workDirError = validateWorkDir(ctx.cwd);
-      if (workDirError) {
-        return {
-          content: [{ type: "text", text: `❌ ${workDirError}` }],
-          details: {},
-        };
-      }
-      const workDir = resolveWorkDir(ctx.cwd);
-      const secondaryMetrics = params.metrics ?? {};
+        // Validate working directory exists
+        const workDirError = validateWorkDir(ctx.cwd);
+        if (workDirError) {
+          return {
+            content: [{ type: "text", text: `❌ ${workDirError}` }],
+            details: {},
+          };
+        }
+        const workDir = resolveWorkDir(ctx.cwd);
+        const secondaryMetrics = params.metrics ?? {};
 
-      // Gate: prevent "keep" when last run's checks failed
-      if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
-        return {
-          content: [{
-            type: "text",
-            text: `❌ Cannot keep — .auto/checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
-          }],
-          details: {},
-        };
-      }
+        // A replayed session, interrupted command, or already-consumed result is
+        // not evidence that the current working tree passed its benchmark.
+        if (params.status === "keep" &&
+            (!runtime.lastRunBenchmark || runtime.lastRunBenchmark.workDir !== workDir)) {
+          return {
+            content: [{ type: "text", text: "❌ Cannot keep — run_experiment must complete successfully in this working directory first. Re-run after a restart, interruption, or previously logged result." }],
+            details: {},
+          };
+        }
+        if (params.status === "keep" && !runtime.lastRunBenchmark?.passed) {
+          return {
+            content: [{ type: "text", text: "❌ Cannot keep — the latest benchmark failed or timed out. Log as 'crash' or run a successful benchmark first." }],
+            details: {},
+          };
+        }
 
-      // Validate secondary metrics consistency (after first experiment establishes them)
-      if (state.secondaryMetrics.length > 0) {
-        const knownNames = new Set(state.secondaryMetrics.map((m) => m.name));
-        const providedNames = new Set(Object.keys(secondaryMetrics));
+        // A caller may transcribe a manual metric only when the run did not
+        // observe the primary METRIC. Never publish a conflicting measured value.
+        const observedPrimary = runtime.lastRunBenchmark?.primaryMetric;
+        if (params.status === "keep" && observedPrimary != null && params.metric !== observedPrimary) {
+          return {
+            content: [{ type: "text", text: `❌ Cannot keep — primary metric must match the latest observed value (${observedPrimary}). Correct metric to that value or rerun the benchmark; force does not override measurement evidence.` }],
+            details: {},
+          };
+        }
 
-        // Check for missing metrics
-        const missing = [...knownNames].filter((n) => !providedNames.has(n));
-        if (missing.length > 0) {
+        // Gate: prevent "keep" when last run's checks failed
+        if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
           return {
             content: [{
               type: "text",
-              text: `❌ Missing secondary metrics: ${missing.join(", ")}\n\nYou must provide all previously tracked metrics. Expected: ${[...knownNames].join(", ")}\nGot: ${[...providedNames].join(", ") || "(none)"}\n\nFix: include ${missing.map((m) => `"${m}": <value>`).join(", ")} in the metrics parameter.`,
+              text: `❌ Cannot keep — .auto/checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
             }],
             details: {},
           };
         }
 
-        // Check for new metrics not yet tracked
-        const newMetrics = [...providedNames].filter((n) => !knownNames.has(n));
-        if (newMetrics.length > 0 && !params.force) {
-          return {
-            content: [{
-              type: "text",
-              text: `❌ New secondary metric${newMetrics.length > 1 ? "s" : ""} not previously tracked: ${newMetrics.join(", ")}\n\nExisting metrics: ${[...knownNames].join(", ")}\n\nIf this metric has proven very valuable to watch, call log_experiment again with force: true to add it. Otherwise, remove it from the metrics parameter.`,
-            }],
-            details: {},
-          };
-        }
-      }
-
-      // ASI: agent-supplied free-form diagnostics
-      const mergedASI = (params.asi && Object.keys(params.asi).length > 0)
-        ? params.asi as ASI
-        : undefined;
-
-      const experiment: ExperimentResult = {
-        commit: params.commit.slice(0, 7),
-        metric: params.metric,
-        metrics: secondaryMetrics,
-        status: params.status,
-        description: params.description,
-        timestamp: Date.now(),
-        segment: state.currentSegment,
-        confidence: null,
-        asi: mergedASI,
-      };
-
-      state.results.push(experiment);
-      runtime.experimentsThisSession++;
-
-      // Register any new secondary metric names
-      for (const name of Object.keys(secondaryMetrics)) {
-        if (!state.secondaryMetrics.find((m) => m.name === name)) {
-          let unit = "";
-          if (name.endsWith("µs")) unit = "µs";
-          else if (name.endsWith("_ms")) unit = "ms";
-          else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
-          else if (name.endsWith("_kb")) unit = "kb";
-          else if (name.endsWith("_mb")) unit = "mb";
-          state.secondaryMetrics.push({ name, unit });
-        }
-      }
-
-      // Baseline = first run in current segment
-      state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
-
-      // Compute confidence score (best improvement as multiple of noise floor)
-      state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
-      experiment.confidence = state.confidence;
-
-      // Build response text
-      const segmentCount = currentResults(state.results, state.currentSegment).length;
-      let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
-
-      if (state.bestMetric !== null) {
-        text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
-        if (segmentCount > 1 && params.status === "keep" && params.metric > 0) {
-          const delta = params.metric - state.bestMetric;
-          const pct = ((delta / state.bestMetric) * 100).toFixed(1);
-          const sign = delta > 0 ? "+" : "";
-          text += ` | this: ${formatNum(params.metric, state.metricUnit)} (${sign}${pct}%)`;
-        }
-      }
-
-      // Show secondary metrics
-      if (Object.keys(secondaryMetrics).length > 0) {
-        const baselines = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
-        const parts: string[] = [];
-        for (const [name, value] of Object.entries(secondaryMetrics)) {
-          const def = state.secondaryMetrics.find((m) => m.name === name);
-          const unit = def?.unit ?? "";
-          let part = `${name}: ${formatNum(value, unit)}`;
-          const bv = baselines[name];
-          if (bv !== undefined && state.results.length > 1 && bv !== 0) {
-            const d = value - bv;
-            const p = ((d / bv) * 100).toFixed(1);
-            const s = d > 0 ? "+" : "";
-            part += ` (${s}${p}%)`;
+        if (params.status === "keep") {
+          const evidence = runtime.lastRunBenchmark!;
+          let provenanceError = evidence.provenanceError;
+          if (!provenanceError) {
+            try {
+              if (captureCandidateProvenance(workDir, evidence.invokedBenchmark) !== evidence.candidateDigest) {
+                provenanceError = "candidate or benchmark/check inputs changed after the benchmark";
+              }
+            } catch (error) {
+              provenanceError = `cannot verify candidate provenance: ${error instanceof Error ? error.message : String(error)}`;
+            }
           }
-          parts.push(part);
+          if (provenanceError) {
+            // An observed mismatch disqualifies this run, even if files are later
+            // restored. Only a fresh run may produce new passing evidence.
+            evidence.provenanceError = provenanceError;
+            return {
+              content: [{ type: "text", text: `❌ Cannot keep — ${provenanceError}. Rerun run_experiment after preparing the candidate; ignore disposable generated artifacts if needed.` }],
+              details: {},
+            };
+          }
         }
-        text += `\nSecondary: ${parts.join("  ")}`;
-      }
 
-      // Show ASI summary
-      if (mergedASI) {
-        const asiParts: string[] = [];
-        for (const [k, v] of Object.entries(mergedASI)) {
-          const s = typeof v === "string" ? v : JSON.stringify(v);
-          asiParts.push(`${k}: ${s.length > 80 ? s.slice(0, 77) + "…" : s}`);
+        // Validate secondary metrics consistency (after first experiment establishes them)
+        if (state.secondaryMetrics.length > 0) {
+          const knownNames = new Set(state.secondaryMetrics.map((m) => m.name));
+          const providedNames = new Set(Object.keys(secondaryMetrics));
+
+          // Check for missing metrics
+          const missing = [...knownNames].filter((n) => !providedNames.has(n));
+          if (missing.length > 0) {
+            return {
+              content: [{
+                type: "text",
+                text: `❌ Missing secondary metrics: ${missing.join(", ")}\n\nYou must provide all previously tracked metrics. Expected: ${[...knownNames].join(", ")}\nGot: ${[...providedNames].join(", ") || "(none)"}\n\nFix: include ${missing.map((m) => `"${m}": <value>`).join(", ")} in the metrics parameter.`,
+              }],
+              details: {},
+            };
+          }
+
+          // Check for new metrics not yet tracked
+          const newMetrics = [...providedNames].filter((n) => !knownNames.has(n));
+          if (newMetrics.length > 0 && !params.force) {
+            return {
+              content: [{
+                type: "text",
+                text: `❌ New secondary metric${newMetrics.length > 1 ? "s" : ""} not previously tracked: ${newMetrics.join(", ")}\n\nExisting metrics: ${[...knownNames].join(", ")}\n\nIf this metric has proven very valuable to watch, call log_experiment again with force: true to add it. Otherwise, remove it from the metrics parameter.`,
+              }],
+              details: {},
+            };
+          }
         }
-        if (asiParts.length > 0) {
-          text += `\n📋 ASI: ${asiParts.join(" | ")}`;
+
+        const loggedGeneration = runtime.runGeneration;
+        const wallClockSeconds = runtime.lastRunDuration;
+
+        // ASI: agent-supplied free-form diagnostics
+        const mergedASI = (params.asi && Object.keys(params.asi).length > 0)
+          ? params.asi as ASI
+          : undefined;
+
+        const experiment: ExperimentResult = {
+          commit: params.commit.slice(0, 7),
+          metric: params.metric,
+          metrics: secondaryMetrics,
+          status: params.status,
+          description: params.description,
+          timestamp: Date.now(),
+          segment: state.currentSegment,
+          confidence: null,
+          asi: mergedASI,
+        };
+
+        state.results.push(experiment);
+        if (params.status !== "keep") runtime.experimentsThisSession++;
+
+        // Register any new secondary metric names
+        for (const name of Object.keys(secondaryMetrics)) {
+          if (!state.secondaryMetrics.find((m) => m.name === name)) {
+            let unit = "";
+            if (name.endsWith("µs")) unit = "µs";
+            else if (name.endsWith("_ms")) unit = "ms";
+            else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
+            else if (name.endsWith("_kb")) unit = "kb";
+            else if (name.endsWith("_mb")) unit = "mb";
+            state.secondaryMetrics.push({ name, unit });
+          }
         }
-      }
 
-      // Show confidence score
-      if (state.confidence !== null) {
-        const confStr = state.confidence.toFixed(1);
-        if (state.confidence >= 2.0) {
-          text += `\n📊 Confidence: ${confStr}× noise floor — improvement is likely real`;
-        } else if (state.confidence >= 1.0) {
-          text += `\n📊 Confidence: ${confStr}× noise floor — improvement is above noise but marginal`;
-        } else {
-          text += `\n⚠️ Confidence: ${confStr}× noise floor — improvement is within noise. Consider re-running to confirm before keeping.`;
+        // Baseline = first run in current segment
+        state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
+
+        // Compute confidence score (best improvement as multiple of noise floor)
+        state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+        experiment.confidence = state.confidence;
+
+        // Build response text
+        const segmentCount = currentResults(state.results, state.currentSegment).length;
+        let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
+
+        if (state.bestMetric !== null) {
+          text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
+          if (segmentCount > 1 && params.status === "keep" && params.metric > 0) {
+            const delta = params.metric - state.bestMetric;
+            const pct = ((delta / state.bestMetric) * 100).toFixed(1);
+            const sign = delta > 0 ? "+" : "";
+            text += ` | this: ${formatNum(params.metric, state.metricUnit)} (${sign}${pct}%)`;
+          }
         }
-      }
 
-      text += `\n(${segmentCount} experiments`;
-      if (state.maxExperiments !== null) {
-        text += ` / ${state.maxExperiments} max`;
-      }
-      text += `)`;
+        // Show secondary metrics
+        if (Object.keys(secondaryMetrics).length > 0) {
+          const baselines = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
+          const parts: string[] = [];
+          for (const [name, value] of Object.entries(secondaryMetrics)) {
+            const def = state.secondaryMetrics.find((m) => m.name === name);
+            const unit = def?.unit ?? "";
+            let part = `${name}: ${formatNum(value, unit)}`;
+            const bv = ownMetric(baselines, name);
+            if (bv !== undefined && state.results.length > 1 && bv !== 0) {
+              const d = value - bv;
+              const p = ((d / bv) * 100).toFixed(1);
+              const s = d > 0 ? "+" : "";
+              part += ` (${s}${p}%)`;
+            }
+            parts.push(part);
+          }
+          text += `\nSecondary: ${parts.join("  ")}`;
+        }
 
-      // Auto-commit only on keep — discards/crashes get reverted anyway
-      if (params.status === "keep") {
-        try {
+        // Show ASI summary
+        if (mergedASI) {
+          const asiParts: string[] = [];
+          for (const [k, v] of Object.entries(mergedASI)) {
+            const s = typeof v === "string" ? v : JSON.stringify(v);
+            asiParts.push(`${k}: ${s.length > 80 ? s.slice(0, 77) + "…" : s}`);
+          }
+          if (asiParts.length > 0) {
+            text += `\n📋 ASI: ${asiParts.join(" | ")}`;
+          }
+        }
+
+        // Show confidence score
+        if (state.confidence !== null) {
+          const confStr = state.confidence.toFixed(1);
+          if (state.confidence >= 2.0) {
+            text += `\n📊 Confidence: ${confStr}× noise floor — improvement is likely real`;
+          } else if (state.confidence >= 1.0) {
+            text += `\n📊 Confidence: ${confStr}× noise floor — improvement is above noise but marginal`;
+          } else {
+            text += `\n⚠️ Confidence: ${confStr}× noise floor — improvement is within noise. Consider re-running to confirm before keeping.`;
+          }
+        }
+
+        text += `\n(${segmentCount} experiments`;
+        if (state.maxExperiments !== null) {
+          text += ` / ${state.maxExperiments} max`;
+        }
+        text += `)`;
+
+        // Auto-commit only on keep — discards/crashes get reverted anyway
+        let verifiedCommit: string | undefined;
+        if (params.status === "keep") {
           const resultData: Record<string, unknown> = {
             status: params.status,
             [state.metricName || "metric"]: params.metric,
             ...secondaryMetrics,
           };
-          const trailerJson = JSON.stringify(resultData);
-          const commitMsg = `${params.description}\n\nResult: ${trailerJson}`;
-
-          const execOpts = { cwd: workDir, timeout: 10000 };
-          const addResult = await pi.exec("git", ["add", "-A"], execOpts);
-          if (addResult.code !== 0) {
-            const addErr = (addResult.stdout + addResult.stderr).trim();
-            throw new Error(`git add failed (exit ${addResult.code}): ${addErr.slice(0, 200)}`);
+          const commitMsg = `${params.description}\n\nResult: ${JSON.stringify(resultData)}`;
+          const outcome = await commitKeptCandidate((...args) => pi.exec(...args), workDir, commitMsg);
+          if (!outcome.ok) {
+            const pauseWarnings = outcome.uncertain ? pauseUncertainKeep(ctx, workDir) : "";
+            const guidance = outcome.uncertain
+              ? "Git outcome is uncertain. Autoresearch is paused. Inspect HEAD, the index and the session log, reconcile them, then explicitly resume. Do not automatically retry this keep."
+              : "No commit was attempted. Inspect and repair the reported problem before retrying; any staging already performed is preserved.";
+            return {
+              content: [{ type: "text", text: `❌ Keep was not recorded (${outcome.phase}): ${outcome.message}\n${guidance}${outcome.beforeHead ? `\nHEAD before operation: ${outcome.beforeHead}` : ""}${pauseWarnings}` }],
+              details: { keepOutcome: outcome },
+              isError: true,
+            };
           }
+          verifiedCommit = outcome.commit;
+          experiment.commit = outcome.commit.slice(0, 7);
+          text += outcome.createdCommit
+            ? `\n📝 Git: committed — ${experiment.commit}`
+            : `\n📝 Git: nothing to commit; using current HEAD ${experiment.commit}`;
+        }
 
-          const diffResult = await pi.exec("git", ["diff", "--cached", "--quiet"], execOpts);
-          if (diffResult.code === 0) {
-            text += `\n📝 Git: nothing to commit (working tree clean)`;
-          } else {
-            const gitResult = await pi.exec("git", ["commit", "-m", commitMsg], execOpts);
-            const gitOutput = (gitResult.stdout + gitResult.stderr).trim();
-            if (gitResult.code === 0) {
-              const firstLine = gitOutput.split("\n")[0] || "";
-              text += `\n📝 Git: committed — ${firstLine}`;
+        const jsonlEntry: Record<string, unknown> = {
+          run: state.results.length,
+          ...experiment,
+        };
+        if (!mergedASI) delete jsonlEntry.asi;
+        const jsonlLine = JSON.stringify(jsonlEntry);
 
-              try {
-                const shaResult = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 });
-                const newSha = (shaResult.stdout || "").trim();
-                if (newSha && newSha.length >= 7) {
-                  experiment.commit = newSha;
-                }
-              } catch {
-                // Keep the original commit hash if rev-parse fails
-              }
-            } else {
-              text += `\n⚠️ Git commit failed (exit ${gitResult.code}): ${gitOutput.slice(0, 200)}`;
+        try {
+          const jsonlPath = autoresearchJsonlPath(workDir);
+          ensureParentDir(jsonlPath);
+          fs.appendFileSync(jsonlPath, jsonlLine + "\n");
+        } catch (e) {
+          if (params.status === "keep") {
+            const pauseWarnings = pauseUncertainKeep(ctx, workDir);
+            return {
+              content: [{ type: "text", text: `❌ Keep log persistence is uncertain: ${e instanceof Error ? e.message : String(e)}\nVerified Git HEAD: ${verifiedCommit}\nAutoresearch is paused. The append may have written a partial or complete entry. Inspect HEAD, the index and the session log, reconcile them, then explicitly resume. Do not automatically retry or append a duplicate.${pauseWarnings}` }],
+              details: { keepOutcome: { ok: false, phase: "append", uncertain: true, commit: verifiedCommit } },
+              isError: true,
+            };
+          }
+          text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
+        }
+
+        if (params.status === "keep") {
+          // Preserve the state object captured by an open fullscreen dashboard.
+          Object.assign(runtime.state, state);
+          runtime.experimentsThisSession++;
+        }
+        // Consume per-run state at publication, before fallible hooks or UI work.
+        // A failure in those follow-up actions does not undo the recorded result.
+        if (runtime.runGeneration === loggedGeneration) invalidateRunEvidence(runtime);
+
+        try { broadcastDashboardUpdate(workDir); }
+        catch (error) {
+          text += `\n⚠️ Dashboard refresh failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+
+        if (params.status !== "keep") {
+          try {
+            const revertScript = `
+              set -e
+              git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
+              git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**'
+            `;
+            const rollback = await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
+            if (rollback.code !== 0 || rollback.killed) {
+              throw new Error(`exit ${rollback.code}${rollback.killed ? ", terminated" : ""}: ${(rollback.stderr || rollback.stdout || "no diagnostic output").slice(0, 500)}`);
+            }
+            text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
+          } catch (e) {
+            const pauseWarnings = pauseUncertainKeep(ctx, workDir);
+            text += `\n❌ Git rollback did not complete: ${e instanceof Error ? e.message : String(e)}\nThe experiment outcome has already been recorded in memory and its log append was attempted. Do not repeat log_experiment. Autoresearch is paused. Inspect HEAD, the index, working tree and session log, reconcile them, then explicitly resume.${pauseWarnings}`;
+            return {
+              content: [{ type: "text", text }],
+              details: {
+                experiment: { ...experiment, metrics: { ...experiment.metrics } },
+                state: cloneExperimentState(state),
+                wallClockSeconds,
+                rollbackOutcome: { ok: false, uncertain: true },
+              },
+              isError: true,
+            };
+          }
+        }
+
+        const runPostLogHook = async (payload: HookPayload): Promise<void> => {
+          const label = payload.event === "after" ? "After" : "Before";
+          let steer: string | null;
+          try {
+            steer = await fireHook(payload);
+          } catch (error) {
+            text += `\n⚠️ ${label} hook failed: ${error instanceof Error ? error.message : String(error)}`;
+            return;
+          }
+          if (steer) {
+            try {
+              await pi.sendUserMessage(steer, { deliverAs: "steer" });
+            } catch (error) {
+              text += `\n⚠️ ${label} hook steering failed: ${error instanceof Error ? error.message : String(error)}`;
             }
           }
-        } catch (e) {
-          text += `\n⚠️ Git commit error: ${e instanceof Error ? e.message : String(e)}`;
-        }
-      }
+        };
 
-      const jsonlEntry: Record<string, unknown> = {
-        run: state.results.length,
-        ...experiment,
-      };
-      if (!mergedASI) delete jsonlEntry.asi;
-      const jsonlLine = JSON.stringify(jsonlEntry);
-
-      try {
-        const jsonlPath = autoresearchJsonlPath(workDir);
-        ensureParentDir(jsonlPath);
-        fs.appendFileSync(jsonlPath, jsonlLine + "\n");
-        broadcastDashboardUpdate(workDir);
-      } catch (e) {
-        text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
-      }
-
-      if (params.status !== "keep") {
-        try {
-          const revertScript = `
-            git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
-            git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
-          `;
-          await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
-          text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
-        } catch (e) {
-          text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
-        }
-      }
-
-      const afterSteer = await fireHook({
-        event: "after",
-        cwd: workDir,
-        run_entry: jsonlEntry,
-        session: buildSessionSnapshot(state),
-      });
-      if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
-
-      const wallClockSeconds = runtime.lastRunDuration;
-      runtime.runningExperiment = null;
-      runtime.lastRunChecks = null;
-      runtime.lastRunDuration = null;
-
-      const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
-      if (limitReached) {
-        text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
-        recordAutoresearchActivation(workDir, false);
-        setAutoresearchMode(ctx, false);
-        ctx.abort();
-      } else if (runtime.autoresearchMode) {
-        const beforeSteer = await fireHook({
-          event: "before",
+        await runPostLogHook({
+          event: "after",
           cwd: workDir,
-          next_run: state.results.length + 1,
-          last_run: jsonlEntry,
+          run_entry: jsonlEntry,
           session: buildSessionSnapshot(state),
         });
-        if (beforeSteer) pi.sendUserMessage(beforeSteer, { deliverAs: "steer" });
+
+        const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
+        if (limitReached) {
+          text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
+          recordAutoresearchActivation(workDir, false);
+          setAutoresearchMode(ctx, false);
+          ctx.abort();
+        } else if (runtime.autoresearchMode) {
+          await runPostLogHook({
+            event: "before",
+            cwd: workDir,
+            next_run: state.results.length + 1,
+            last_run: jsonlEntry,
+            session: buildSessionSnapshot(state),
+          });
+        }
+
+        updateWidget(ctx);
+
+        // Refresh fullscreen overlay if open
+        if (overlayTui) overlayTui.requestRender();
+
+        return {
+          content: [{ type: "text", text }],
+          details: {
+            experiment: { ...experiment, metrics: { ...experiment.metrics } },
+            state: cloneExperimentState(state),
+            wallClockSeconds,
+          } as LogDetails,
+        };
+      } finally {
+        runtime.logInProgress = false;
       }
-
-      updateWidget(ctx);
-
-      // Refresh fullscreen overlay if open
-      if (overlayTui) overlayTui.requestRender();
-
-      return {
-        content: [{ type: "text", text }],
-        details: {
-          experiment: { ...experiment, metrics: { ...experiment.metrics } },
-          state: cloneExperimentState(state),
-          wallClockSeconds,
-        } as LogDetails,
-      };
     },
 
     renderCall(args, theme) {
@@ -2584,7 +2885,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     renderResult(result, _options, theme) {
       const d = result.details as LogDetails | undefined;
-      if (!d) {
+      if (result.isError || !d?.experiment || !d.state) {
         const t = result.content[0];
         return new Text(t?.type === "text" ? t.text : "", 0, 0);
       }
@@ -2850,6 +3151,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   let dashboardServerPort: number | null = null;
   let dashboardServerWorkDir: string | null = null;
   let dashboardServerHtmlPath: string | null = null;
+  let dashboardGeneration = 0;
+  let pendingDashboard: {
+    server: Server;
+    workDir: string;
+    promise: Promise<number>;
+    reject: (error: Error) => void;
+  } | null = null;
   const dashboardSseClients = new Set<ServerResponse>();
 
   function openInBrowser(url: string): void {
@@ -2870,6 +3178,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   function stopDashboardServer(): void {
+    dashboardGeneration++;
+    if (pendingDashboard) {
+      const pending = pendingDashboard;
+      pendingDashboard = null;
+      pending.reject(new Error("Dashboard export cancelled"));
+      try { pending.server.close(); } catch { /* ignore */ }
+    }
     for (const client of dashboardSseClients) {
       try { client.end(); } catch { /* ignore */ }
     }
@@ -2941,59 +3256,81 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   function startStaticServer(workDir: string, dashboardHtmlPath: string): Promise<number> {
-    return new Promise((resolve, reject) => {
-      const resolvedWorkDir = path.resolve(workDir);
-      const resolvedDashboardHtmlPath = path.resolve(dashboardHtmlPath);
+    const resolvedWorkDir = path.resolve(workDir);
+    const resolvedDashboardHtmlPath = path.resolve(dashboardHtmlPath);
+    if (dashboardServer && dashboardServerWorkDir === resolvedWorkDir && dashboardServerPort) {
+      dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+      return Promise.resolve(dashboardServerPort);
+    }
+    if (pendingDashboard?.workDir === resolvedWorkDir) {
+      dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+      return pendingDashboard.promise;
+    }
 
-      if (dashboardServer && dashboardServerWorkDir === resolvedWorkDir && dashboardServerPort) {
-        dashboardServerHtmlPath = resolvedDashboardHtmlPath;
-        resolve(dashboardServerPort);
+    stopDashboardServer();
+    const generation = dashboardGeneration;
+    dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+    let resolve!: (port: number) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<number>((res, rej) => { resolve = res; reject = rej; });
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+
+      if (url.pathname === "/events") {
+        registerSseClient(res);
         return;
       }
 
-      stopDashboardServer();
-      dashboardServerHtmlPath = resolvedDashboardHtmlPath;
+      const filePath = resolveServedFile(resolvedWorkDir, url.pathname);
+      if (!filePath) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
 
-      const server = createServer((req, res) => {
-        const url = new URL(req.url ?? "/", "http://127.0.0.1");
-
-        if (url.pathname === "/events") {
-          registerSseClient(res);
-          return;
-        }
-
-        const filePath = resolveServedFile(resolvedWorkDir, url.pathname);
-        if (!filePath) {
+      fs.readFile(filePath, (err, data) => {
+        if (err) {
           res.writeHead(404);
           res.end();
           return;
         }
-
-        fs.readFile(filePath, (err, data) => {
-          if (err) {
-            res.writeHead(404);
-            res.end();
-            return;
-          }
-          res.writeHead(200, { "Content-Type": fileContentType(filePath) });
-          res.end(data);
-        });
+        res.writeHead(200, { "Content-Type": fileContentType(filePath) });
+        res.end(data);
       });
+    });
 
+    pendingDashboard = { server, workDir: resolvedWorkDir, promise, reject };
+    const fail = (error: Error) => {
+      // The error handler also remains active after listen succeeds. Retire only
+      // this server's ownership; a late error from a replaced server is harmless.
+      if (dashboardServer === server) stopDashboardServer();
+      if (pendingDashboard?.server === server) pendingDashboard = null;
+      try { server.close(); } catch { /* ignore */ }
+      reject(error);
+    };
+    server.on("error", fail);
+    try {
       server.listen(0, "127.0.0.1", () => {
-        const address = server.address();
-        if (!address || typeof address === "string") {
-          reject(new Error("Failed to bind dashboard server"));
+        if (generation !== dashboardGeneration) {
+          server.close();
           return;
         }
+        const address = server.address();
+        if (!address || typeof address === "string") {
+          fail(new Error("Failed to bind dashboard server"));
+          return;
+        }
+        pendingDashboard = null;
         dashboardServer = server;
         dashboardServerPort = address.port;
         dashboardServerWorkDir = resolvedWorkDir;
         resolve(address.port);
       });
 
-      server.on("error", reject);
-    });
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error(String(error)));
+    }
+    return promise;
   }
 
   async function exportDashboard(ctx: ExtensionContext): Promise<void> {
@@ -3012,7 +3349,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     try {
       const dashboardHtmlPath = writeDashboardFile(workDir);
-      const port = await startStaticServer(workDir, dashboardHtmlPath);
+      const starting = startStaticServer(workDir, dashboardHtmlPath);
+      const generation = dashboardGeneration;
+      const port = await starting;
+      if (generation !== dashboardGeneration) return;
       const url = `http://127.0.0.1:${port}`;
       openInBrowser(url);
       ctx.ui.notify(`Dashboard at ${url} (live updates)`, "info");
@@ -3053,9 +3393,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         setAutoresearchMode(ctx, false);
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
-        runtime.lastRunChecks = null;
-        runtime.lastRunDuration = null;
-        runtime.runningExperiment = null;
+        invalidateRunEvidence(runtime);
         cancelPendingResume(runtime);
         stopDashboardServer();
         clearSessionUi(ctx);
@@ -3072,6 +3410,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (runtime.logInProgress) {
+        ctx.ui.notify("An experiment log operation is in progress. Wait for its outcome before clearing or restarting the session; /autoresearch off remains available.", "warning");
+        return;
+      }
+
       if (command === "clear") {
         let workDir = ctx.cwd;
         try {
@@ -3084,9 +3427,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         setAutoresearchMode(ctx, false);
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
-        runtime.lastRunChecks = null;
-        runtime.lastRunDuration = null;
-        runtime.runningExperiment = null;
+        invalidateRunEvidence(runtime);
         cancelPendingResume(runtime);
         runtime.state = createExperimentState();
         stopDashboardServer();
@@ -3107,6 +3448,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }
         }
 
+        runtime.keepReconciliationRequired = false;
         if (deletedPaths.length > 0) {
           ctx.ui.notify(`Deleted ${deletedPaths.join(", ")} and turned autoresearch mode OFF`, "info");
         } else {
@@ -3131,8 +3473,44 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`Autoresearch not activated: ${activationError}`, "error");
         return;
       }
-      recordAutoresearchActivation(workDir, true);
-      setAutoresearchMode(ctx, true);
+      const reconciling = runtime.keepReconciliationRequired;
+      if (reconciling) {
+        try {
+          // Explicit resume reads the user's reconciled log, never stale tool history.
+          // Do not repair/truncate bytes or silently skip a partially appended line.
+          const content = fs.readFileSync(autoresearchJsonlPath(workDir), "utf8");
+          if (content && !content.endsWith("\n")) throw new Error("The log must end with a newline before another append.");
+          for (const line of content.split("\n")) {
+            if (line.trim() && !parseJsonlEntry(line)) throw new Error("Every nonempty log line must be a complete JSON object.");
+          }
+          const restored = {
+            ...createExperimentState(),
+            ...reconstructJsonlState(content),
+            maxExperiments: readMaxExperiments(ctx.cwd),
+          };
+          restored.bestMetric = findBaselineMetric(restored.results, restored.currentSegment);
+          restored.confidence = computeConfidence(restored.results, restored.currentSegment, restored.bestDirection);
+          Object.assign(runtime.state, restored);
+          runtime.lastRunChecks = null;
+          runtime.lastRunDuration = null;
+          runtime.runningExperiment = null;
+          runtime.experimentsThisSession = 0;
+          cancelPendingResume(runtime);
+        } catch (error) {
+          ctx.ui.notify(`Cannot resume from the reconciled session log: ${error instanceof Error ? error.message : String(error)} Repair it manually, or explicitly clear the session to reset it. Autoresearch remains paused.`, "error");
+          return;
+        }
+      }
+      try {
+        recordAutoresearchActivation(workDir, true);
+        setAutoresearchMode(ctx, true);
+      } catch (error) {
+        if (!reconciling) throw error;
+        const warnings = pauseUncertainKeep(ctx, workDir);
+        ctx.ui.notify(`Could not resume the reconciled session: ${error instanceof Error ? error.message : String(error)}${warnings}`, "error");
+        return;
+      }
+      runtime.keepReconciliationRequired = false;
       runtime.autoResumeTurns = 0;
       const rulesLoaded = hasAutoresearchRules(ctx);
       // No .auto/prompt.md yet — load the create skill so the agent follows the

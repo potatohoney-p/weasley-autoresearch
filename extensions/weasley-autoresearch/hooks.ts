@@ -1,26 +1,34 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 
 import { hasAutoresearchConfigHeader } from "./jsonl.ts";
 import { hookScriptPath } from "./paths.ts";
 
 const TIMEOUT_MS = 30_000;
-const STDOUT_MAX_BYTES = 8 * 1024;
-const TRUNCATION_MARKER = "\n…[truncated: hook stdout exceeded 8KB]";
+const OUTPUT_MAX_BYTES = 8 * 1024;
 
-const NEWLINE = 0x0a;
-const UTF8_CONT_MASK = 0xc0;
-const UTF8_CONT = 0x80; // continuation byte: 10xxxxxx
-const UTF8_LEAD = 0xc0; // multi-byte leader: 11xxxxxx
-
-/** Trim at the last newline, falling back to the last complete UTF-8 character. */
-function truncateAtBoundary(buf: Buffer): Buffer {
-  const newlineEnd = buf.lastIndexOf(NEWLINE);
-  if (newlineEnd >= 0) return buf.subarray(0, newlineEnd + 1);
-  let end = buf.length;
-  while (end > 0 && (buf[end - 1] & UTF8_CONT_MASK) === UTF8_CONT) end--;
-  if (end > 0 && (buf[end - 1] & UTF8_CONT_MASK) === UTF8_LEAD) end--;
-  return buf.subarray(0, end);
+/** Retain a bounded byte prefix; decoding after collection preserves split UTF-8. */
+export function createHookOutputCollector(stream: "stdout" | "stderr") {
+  const buffer = Buffer.alloc(OUTPUT_MAX_BYTES);
+  let length = 0;
+  let truncated = false;
+  return {
+    append(chunk: Buffer) {
+      const kept = Math.min(chunk.length, OUTPUT_MAX_BYTES - length);
+      chunk.copy(buffer, length, 0, kept);
+      length += kept;
+      if (kept < chunk.length) truncated = true;
+    },
+    text(): string {
+      const bytes = buffer.subarray(0, length);
+      if (!truncated) return bytes.toString("utf8");
+      // An incomplete final code point at the byte cap must not become U+FFFD.
+      const decoder = new StringDecoder("utf8");
+      const prefix = decoder.write(bytes);
+      return prefix + `\n…[truncated: hook ${stream} exceeded 8KB]`;
+    },
+  };
 }
 
 export type HookStage = "before" | "after";
@@ -58,6 +66,7 @@ export interface HookResult {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
+  stdinError?: string;
   durationMs: number;
 }
 
@@ -87,35 +96,21 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
   return new Promise<HookResult>((resolve) => {
     const child = spawn("bash", [script], { cwd: payload.cwd, timeout: TIMEOUT_MS });
 
-    let stdout = "";
-    let stdoutBytes = 0;
-    let stdoutFull = false;
-    let stderr = "";
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (stdoutFull) return;
-      const remaining = STDOUT_MAX_BYTES - stdoutBytes;
-      if (chunk.length <= remaining) {
-        stdout += chunk.toString("utf8");
-        stdoutBytes += chunk.length;
-        return;
-      }
-      const kept = truncateAtBoundary(chunk.subarray(0, remaining));
-      stdout += kept.toString("utf8") + TRUNCATION_MARKER;
-      stdoutFull = true;
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
+    const stdout = createHookOutputCollector("stdout");
+    const stderr = createHookOutputCollector("stderr");
+    child.stdout.on("data", (chunk: Buffer) => stdout.append(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
+    let stdinError: string | undefined;
+    child.stdin.on("error", (err) => { stdinError = err.message; });
 
     const finish = (exitCode: number | null, extraErr = "") => {
-      const combinedStderr = extraErr ? (stderr ? `${stderr}\n${extraErr}` : extraErr) : stderr;
+      if (extraErr) stderr.append(Buffer.from(`\n${extraErr}`, "utf8"));
       resolve({
         fired: true,
-        stdout,
-        stderr: combinedStderr,
+        stdout: stdout.text(),
+        stderr: stderr.text(),
         exitCode,
+        ...(stdinError ? { stdinError } : {}),
         timedOut: child.killed,
         durationMs: Date.now() - t0,
       });
@@ -131,9 +126,16 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
 
 export function steerMessageFor(stage: HookStage, result: HookResult): string | null {
   if (!result.fired) return null;
-  if (result.timedOut) return `[${stage} hook timed out after ${TIMEOUT_MS / 1000}s]`;
-  if (result.exitCode !== 0) {
-    const parts = [`[${stage} hook exited ${result.exitCode}]`];
+  if (result.timedOut) {
+    const timeout = `[${stage} hook timed out after ${TIMEOUT_MS / 1000}s]`;
+    return result.stdinError
+      ? `${timeout}\n[${stage} hook input delivery failed: ${result.stdinError}]`
+      : timeout;
+  }
+  if (result.stdinError || result.exitCode !== 0) {
+    const parts = [result.stdinError
+      ? `[${stage} hook input delivery failed: ${result.stdinError}; exited ${result.exitCode}]`
+      : `[${stage} hook exited ${result.exitCode}]`];
     const err = result.stderr.trim();
     const out = result.stdout.trim();
     if (err) parts.push(err);
@@ -151,6 +153,7 @@ export function hookLogEntry(stage: HookStage, result: HookResult): Record<strin
     duration_ms: result.durationMs,
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
     timed_out: result.timedOut,
+    ...(result.stdinError ? { stdin_error: result.stdinError } : {}),
   };
 }
 
