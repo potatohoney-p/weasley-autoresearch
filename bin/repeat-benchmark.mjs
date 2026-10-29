@@ -80,9 +80,10 @@ export function median(values) {
   if (sorted.length % 2) return sorted[mid];
   const lower = sorted[mid - 1];
   const upper = sorted[mid];
-  return Math.sign(lower) === Math.sign(upper)
-    ? lower + (upper - lower) / 2
-    : lower / 2 + upper / 2;
+  // Add before halving to preserve subnormal values and cancellation. Only
+  // halve the operands separately when the sum overflows for finite samples.
+  const sum = lower + upper;
+  return Number.isFinite(sum) ? sum / 2 : lower / 2 + upper / 2;
 }
 
 function summarize(trials) {
