@@ -199,6 +199,8 @@ interface AutoresearchRuntime {
     passed: boolean;
     /** Observed primary value, copied independently of returned tool details. */
     primaryMetric: number | null;
+    /** Private snapshot, never shared with returned tool details. */
+    observedMetrics: Map<string, number>;
     workDir: string;
     candidateDigest: string;
     invokedBenchmark: string | null;
@@ -2345,7 +2347,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Publish only after the current call has finished preparing its result.
       // Late completions must not revive evidence invalidated while awaiting.
       assertCurrentRun();
-      runtime.lastRunBenchmark = { passed: benchmarkPassed, primaryMetric: parsedPrimary, workDir, candidateDigest, invokedBenchmark, provenanceError };
+      runtime.lastRunBenchmark = { passed: benchmarkPassed, primaryMetric: parsedPrimary, observedMetrics: new Map(parsedMetricMap), workDir, candidateDigest, invokedBenchmark, provenanceError };
       runtime.lastRunChecks = checksPass !== null ? { pass: checksPass, output: checksOutput, duration: checksDuration } : null;
       runtime.lastRunDuration = durationSeconds;
       return {
@@ -2545,6 +2547,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             content: [{ type: "text", text: `❌ Cannot keep — primary metric must match the latest observed value (${observedPrimary}). Correct metric to that value or rerun the benchmark; force does not override measurement evidence.` }],
             details: {},
           };
+        }
+
+        if (params.status === "keep") {
+          const observed = runtime.lastRunBenchmark!.observedMetrics;
+          for (const [name, value] of Object.entries(secondaryMetrics)) {
+            if (observed.has(name) && value !== observed.get(name)) {
+              return {
+                content: [{ type: "text", text: `❌ Cannot keep — secondary metric "${name}" must match the latest observed value (${observed.get(name)}). Correct the value or rerun the benchmark; force does not override measurement evidence.` }],
+                details: {},
+              };
+            }
+          }
         }
 
         // Gate: prevent "keep" when last run's checks failed

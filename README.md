@@ -279,7 +279,11 @@ If that run parsed the configured primary `METRIC`, a `keep` must supply exactly
 that numeric value. A transcription mismatch is rejected before Git, hooks, or
 result publication, even with `force: true`. Correcting the value can reuse the
 same unconsumed run. When no primary metric was parsed, manual metrics remain
-supported. This guard does not certify unparsed output, secondary metrics, or
+supported. Supplied secondary metrics that were observed in that same run must
+also match exactly; the private observation snapshot cannot be rewritten through
+returned tool details. Optional omission and manually supplied, unobserved names
+remain supported, subject to the existing secondary-metric schema rules. Each
+fresh run replaces the snapshot. This guard does not certify unparsed output or
 benchmark methodology; it does not change the parser's existing output limits.
 
 Supported forms retain literal script arguments and quoted/escaped paths:
