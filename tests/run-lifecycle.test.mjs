@@ -337,3 +337,43 @@ for (const status of ['discard', 'crash', 'checks_failed']) {
     assert.equal(logged.details.experiment?.metric, 0);
   });
 }
+
+for (const observed of [0, -5, 1.25e-12]) {
+  test(`keep rejects contradictory secondary observation ${observed}`, async (t) => {
+    const h = await fixture(t);
+    await writeFile(join(h.cwd, '.auto', 'measure.sh'), `printf 'METRIC latency=1\\nMETRIC throughput=${observed}\\n'\n`);
+    const measured = await h.run();
+    // Returned tool details must not be able to rewrite private evidence.
+    measured.details.parsedMetrics.throughput = observed + 10;
+    const path = join(h.cwd, '.auto', 'log.jsonl');
+    const before = await readFile(path);
+    const calls = h.gitCalls.length;
+    const rejected = await h.call('log_experiment', { ...keep, metrics: { throughput: observed + 10 }, force: true });
+    assert.equal(rejected.details.experiment, undefined);
+    assert.match(text(rejected), /secondary metric.*throughput.*match/i);
+    assert.deepEqual(await readFile(path), before);
+    assert.equal(h.gitCalls.length, calls);
+    const corrected = await h.call('log_experiment', { ...keep, metrics: { throughput: observed } });
+    assert.equal(corrected.details.experiment?.metrics.throughput, observed, text(corrected));
+  });
+}
+
+for (const next of [2, null]) {
+  test(`fresh secondary observation replaces previous evidence with ${next}`, async (t) => {
+    const h = await fixture(t);
+    await writeFile(join(h.cwd, '.auto', 'measure.sh'), "printf 'METRIC latency=1\\nMETRIC throughput=7\\n'\n");
+    await h.run();
+    await writeFile(join(h.cwd, '.auto', 'measure.sh'), next === null ? "printf 'METRIC latency=1\\n'\n" : `printf 'METRIC latency=1\\nMETRIC throughput=${next}\\n'\n`);
+    await h.run();
+    const value = next ?? 9;
+    const logged = await h.call('log_experiment', { ...keep, metrics: { throughput: value, manual: 3 } });
+    assert.equal(logged.details.experiment?.metrics.throughput, value, text(logged));
+  });
+}
+
+test('observed secondary does not require supplying optional metrics', async (t) => {
+  const h = await fixture(t);
+  await writeFile(join(h.cwd, '.auto', 'measure.sh'), "printf 'METRIC latency=1\\nMETRIC throughput=7\\n'\n");
+  await h.run();
+  assert.equal((await h.call('log_experiment', keep)).details.experiment?.metric, 1);
+});
