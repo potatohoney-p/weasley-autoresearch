@@ -12,6 +12,7 @@ import { getEventListeners } from 'node:events';
 import { promisify } from 'node:util';
 const execFile = promisify(childProcess.execFile);
 import extension from '../extensions/weasley-autoresearch/index.ts';
+import { isLinuxProcessTerminated } from './helpers/linux-process-state.mjs';
 
 function harness(cwd) {
   const tools = new Map();
@@ -164,11 +165,7 @@ test('escalation still terminates same-group descendants after all child pipes c
     const pid = Number(await eventuallyFile(join(cwd, 'desc.pid')));
     const deadline = Date.now() + 1000;
     while (Date.now() < deadline) {
-      try {
-        // Linux may briefly retain a killed orphan as a zombie until PID 1 reaps it.
-        const stat = await readFile(`/proc/${pid}/stat`, 'utf8');
-        if (/\) Z /.test(stat)) return;
-      } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+      if (await isLinuxProcessTerminated(pid)) return;
       await delay(10);
     }
     assert.fail('same-group descendant survived escalation');
@@ -236,8 +233,7 @@ for (const escaped of [false, true]) {
         else {
           const deadline = Date.now() + 1000;
           while (Date.now() < deadline) {
-            try { if (/\) Z /.test(await readFile(`/proc/${pid}/stat`, 'utf8'))) return; }
-            catch (error) { if (error.code === 'ENOENT') return; throw error; }
+            if (await isLinuxProcessTerminated(pid)) return;
             await delay(10);
           }
           assert.fail('same-group descendant survived output-failure cleanup');
