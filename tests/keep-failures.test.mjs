@@ -539,3 +539,51 @@ test("partial rollback pauses despite pause callback failures and never calls af
   assert.equal(fs.existsSync(join(h.cwd, "hook-marker")), false);
   assert.equal((await h.call("log_experiment", keep)).isError, true);
 });
+
+for (const status of ['discard', 'crash', 'checks_failed']) {
+  for (const failure of ['directory', 'partial', 'complete']) {
+    test(`${status} preserves the candidate when log append fails after ${failure}`, async (t) => {
+      const h = await fixture(t);
+      const log = join(h.cwd, '.auto', 'log.jsonl');
+      const beforeHead = await h.head();
+      await writeFile(join(h.cwd, 'untracked.txt'), 'unrecorded experiment evidence\n');
+      await mkdir(join(h.cwd, '.auto', 'hooks'));
+      await writeFile(join(h.cwd, '.auto', 'hooks', 'after.sh'), 'echo should-not-run > hook-marker\n', { mode: 0o755 });
+      const beforeCalls = h.calls.length;
+      let appended;
+      if (failure === 'directory') {
+        await rename(log, log + '.saved');
+        await mkdir(log);
+      } else {
+        const originalAppend = fs.appendFileSync;
+        t.mock.method(fs, 'appendFileSync', (file, data, ...args) => {
+          if (file !== log) return originalAppend(file, data, ...args);
+          appended = failure === 'partial' ? data.slice(0, 20) : data;
+          originalAppend(file, appended, ...args);
+          throw new Error('injected append failure after bytes were written');
+        });
+        syncBuiltinESMExports();
+        t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+      }
+      const result = await h.call('log_experiment', { ...keep, status, metrics: { throughput: 2 } });
+      assert.equal(result.isError, true);
+      assert.equal(result.details.experiment, undefined, 'unconfirmed append must not publish a result');
+      assert.match(text(result), /persistence is uncertain/i);
+      assert.doesNotMatch(text(result), /Git: reverted/);
+      assert.equal(await h.head(), beforeHead);
+      assert.equal(await readFile(join(h.cwd, 'candidate.txt'), 'utf8'), 'candidate\n');
+      assert.equal(await readFile(join(h.cwd, 'untracked.txt'), 'utf8'), 'unrecorded experiment evidence\n');
+      assert.equal(h.calls.length, beforeCalls, 'no rollback or hooks after failed append');
+      assert.equal(fs.existsSync(join(h.cwd, 'hook-marker')), false);
+      assert.equal(h.aborted(), 1);
+      assert.deepEqual(h.activeTools(), []);
+      for (const [tool, params] of [
+        ['log_experiment', { ...keep, status }],
+        ['run_experiment', { command: 'echo should-not-run' }],
+        ['init_experiment', { name: 'retry', metric_name: 'latency' }],
+      ]) assert.match(text(await h.call(tool, params)), /reconcile.*explicitly resume/);
+      assert.equal(h.calls.length, beforeCalls);
+      if (appended) assert.ok((await readFile(log, 'utf8')).endsWith(appended), 'leave partial or complete bytes for reconciliation');
+    });
+  }
+}

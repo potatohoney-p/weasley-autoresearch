@@ -2507,8 +2507,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (runtime.keepReconciliationRequired) return reconciliationResult();
       runtime.logInProgress = true;
       try {
-        // A keep is published only after its Git outcome and log append succeed.
-        const state = params.status === "keep" ? cloneExperimentState(runtime.state) : runtime.state;
+        // Publish every outcome only after its log append succeeds. A failed
+        // non-keep append must not discard the candidate or its only evidence.
+        const state = cloneExperimentState(runtime.state);
 
         // Validate working directory exists
         const workDirError = validateWorkDir(ctx.cwd);
@@ -2632,7 +2633,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
 
         state.results.push(experiment);
-        if (params.status !== "keep") runtime.experimentsThisSession++;
 
         // Register any new secondary metric names
         for (const name of Object.keys(secondaryMetrics)) {
@@ -2766,14 +2766,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               isError: true,
             };
           }
-          text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
+          const pauseWarnings = pauseUncertainKeep(ctx, workDir);
+          return {
+            content: [{ type: "text", text: `❌ Experiment log persistence is uncertain: ${e instanceof Error ? e.message : String(e)}\nNo rollback was attempted. The append may have written a partial or complete entry. Autoresearch is paused. Inspect the working tree and session log, reconcile them, then explicitly resume. Do not automatically retry or append a duplicate.${pauseWarnings}` }],
+            details: { logOutcome: { ok: false, phase: "append", uncertain: true, status: params.status } },
+            isError: true,
+          };
         }
 
-        if (params.status === "keep") {
-          // Preserve the state object captured by an open fullscreen dashboard.
-          Object.assign(runtime.state, state);
-          runtime.experimentsThisSession++;
-        }
+        // Preserve the state object captured by an open fullscreen dashboard.
+        Object.assign(runtime.state, state);
+        runtime.experimentsThisSession++;
         // Consume per-run state at publication, before fallible hooks or UI work.
         // A failure in those follow-up actions does not undo the recorded result.
         if (runtime.runGeneration === loggedGeneration) invalidateRunEvidence(runtime);
@@ -2797,7 +2800,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
           } catch (e) {
             const pauseWarnings = pauseUncertainKeep(ctx, workDir);
-            text += `\n❌ Git rollback did not complete: ${e instanceof Error ? e.message : String(e)}\nThe experiment outcome has already been recorded in memory and its log append was attempted. Do not repeat log_experiment. Autoresearch is paused. Inspect HEAD, the index, working tree and session log, reconcile them, then explicitly resume.${pauseWarnings}`;
+            text += `\n❌ Git rollback did not complete: ${e instanceof Error ? e.message : String(e)}\nThe experiment outcome has already been recorded in memory and its log append returned successfully. Do not repeat log_experiment. Autoresearch is paused. Inspect HEAD, the index, working tree and session log, reconcile them, then explicitly resume.${pauseWarnings}`;
             return {
               content: [{ type: "text", text }],
               details: {
