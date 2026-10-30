@@ -182,7 +182,12 @@ these follow-up actions. Do not repeat an already-recorded keep just because its
 This is in-process outcome reporting, not an atomic Git/log transaction or a recovery journal.
 It does not lock other sessions or external writers, guarantee physical durability, or recover
 automatically after process death. A different session has no new persisted uncertainty marker.
-Discard/crash rollback behavior is unchanged.
+Discard, crash, and checks-failed outcomes also publish state only after the JSONL append
+returns successfully. If that append throws, no checkout/clean rollback, hooks, or continuation
+runs: the candidate and untracked experiment files remain available for inspection. The
+append may have written zero, partial, or complete bytes, so the session pauses behind the
+same reconciliation gate rather than retrying automatically. This does not make the append
+atomic or guarantee physical durability.
 
 ## Configuration
 
@@ -245,7 +250,7 @@ During an active clean session:
 
 A non-keep rollback stops at the first failing Git command. A nonzero exit, termination or
 execution error pauses the session and requires explicit reconciliation before resuming.
-The outcome is already recorded in memory and its log append has been attempted at that point;
+The outcome is already recorded in memory and its log append returned successfully at that point;
 do not repeat `log_experiment`. Inspect HEAD, the index, working tree and `.auto/log.jsonl`,
 reconcile them, then explicitly resume with `/autoresearch <goal>`. Failed rollback does not
 run after/before hooks or claim that changes were reverted. Partial filesystem changes are
