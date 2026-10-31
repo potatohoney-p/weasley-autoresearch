@@ -41,6 +41,33 @@ async function within(promise, ms = 1800) {
   try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('cancellation did not settle')), ms); })]); }
   finally { clearTimeout(timer); }
 }
+// These tests need a running TERM handler/descendant, not a startup deadline.
+// Capture only the configured benchmark timer; keep real escalation and watchdogs.
+function controlledBenchmarkTimeout(t) {
+  const realSetTimeout = globalThis.setTimeout;
+  let fire;
+  let handle;
+  t.mock.method(globalThis, 'setTimeout', (callback, ms, ...args) => {
+    if (ms !== 300) return realSetTimeout(callback, ms, ...args);
+    assert.equal(fire, undefined, 'expected exactly one benchmark timeout');
+    // A real handle lets production clearTimeout keep its normal semantics.
+    handle = realSetTimeout(() => {}, 30_000);
+    fire = () => { clearTimeout(handle); callback(...args); };
+    return handle;
+  });
+  t.after(() => clearTimeout(handle));
+  return () => {
+    assert.equal(typeof fire, 'function', 'benchmark must arm its timeout');
+    fire();
+  };
+}
+async function timeoutAfterReady(t, cwd, start) {
+  const expire = controlledBenchmarkTimeout(t);
+  const pending = start({ timeout_seconds: 0.3 });
+  await eventuallyFile(join(cwd, 'ready'));
+  expire();
+  return within(pending);
+}
 async function fixture(body, fn) {
   const cwd = await mkdtemp(join(tmpdir(), 'weasley-cancel-'));
   let pending;
@@ -94,17 +121,17 @@ test('abort settles a benchmark that ignores SIGTERM', async () => {
     assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
   });
 });
-test('timeout escalation survives direct child exit while a descendant holds pipes', async () => {
+test('timeout escalation survives direct child exit while a descendant holds pipes', async t => {
   await fixture(`echo $$ > group.pid\ntrap 'exit 0' TERM\nbash -c 'trap "" TERM; echo $BASHPID > desc.pid; echo ready > ready; sleep 20' &\nwait\n`, async ({ cwd, start }) => {
-    const result = await within(start({ timeout_seconds: 0.3 }));
+    const result = await timeoutAfterReady(t, cwd, start);
     assert.equal(result.details.timedOut, true);
     assert.equal(result.details.passed, false);
     assert.equal(result.details.exitCode, 0);
   });
 });
-test('timeout releases owned pipes retained by a detached descendant', { skip: process.platform !== 'linux' }, async () => {
+test('timeout releases owned pipes retained by a detached descendant', { skip: process.platform !== 'linux' }, async t => {
   await fixture(`echo $$ > group.pid\nsetsid bash -c 'trap "" TERM; echo $$ > escape.pid; echo ready > ready; sleep 20' &\nwait\n`, async ({ cwd, start }) => {
-    const result = await within(start({ timeout_seconds: 0.3 }));
+    const result = await timeoutAfterReady(t, cwd, start);
     assert.equal(result.details.timedOut, true);
     assert.equal(result.details.passed, false);
     // The escaped process is deliberately not claimed to be terminated.
@@ -122,10 +149,10 @@ test('ordinary benchmark exit and metrics are unchanged', async () => {
   });
 });
 
-test('timeout does not run correctness checks or become passing after TERM handler exits zero', async () => {
-  await fixture(`echo $$ > group.pid\ntrap 'exit 0' TERM\necho ready > ready\nsleep 20\n`, async ({ cwd, start, checks }) => {
+test('timeout does not run correctness checks or become passing after TERM handler exits zero', async t => {
+  await fixture(`sleep 0.6\necho $$ > group.pid\ntrap 'exit 0' TERM\necho ready > ready\nsleep 20\n`, async ({ cwd, start, checks }) => {
     await writeFile(join(cwd, 'autoresearch.checks.sh'), 'exit 0\n');
-    const result = await within(start({ timeout_seconds: 0.3 }));
+    const result = await timeoutAfterReady(t, cwd, start);
     assert.equal(result.details.exitCode, 0);
     assert.equal(result.details.timedOut, true);
     assert.equal(result.details.passed, false);
@@ -157,9 +184,9 @@ test('pre-aborted calls never spawn a benchmark', async () => {
   });
 });
 
-test('escalation still terminates same-group descendants after all child pipes close', { skip: process.platform !== 'linux' }, async () => {
+test('escalation still terminates same-group descendants after all child pipes close', { skip: process.platform !== 'linux' }, async t => {
   await fixture(`echo $$ > group.pid\ntrap 'exit 0' TERM\nbash -c 'trap "" TERM; echo $BASHPID > desc.pid; echo ready > ready; sleep 20' >/dev/null 2>&1 &\nwait\n`, async ({ cwd, start }) => {
-    const result = await within(start({ timeout_seconds: 0.3 }));
+    const result = await timeoutAfterReady(t, cwd, start);
     assert.equal(result.details.timedOut, true);
     const pid = Number(await eventuallyFile(join(cwd, 'desc.pid')));
     const deadline = Date.now() + 1000;
