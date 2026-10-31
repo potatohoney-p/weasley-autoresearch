@@ -7,6 +7,7 @@ import { hookScriptPath } from "./paths.ts";
 
 const TIMEOUT_MS = 30_000;
 const OUTPUT_MAX_BYTES = 8 * 1024;
+const KILL_GRACE_MS = 250;
 
 /** Retain a bounded byte prefix; decoding after collection preserves split UTF-8. */
 export function createHookOutputCollector(stream: "stdout" | "stderr") {
@@ -94,7 +95,34 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
 
   const t0 = Date.now();
   return new Promise<HookResult>((resolve) => {
-    const child = spawn("bash", [script], { cwd: payload.cwd, timeout: TIMEOUT_MS });
+    const child = spawn("bash", [script], {
+      cwd: payload.cwd, detached: process.platform !== "win32",
+    });
+    let timedOut = false;
+    let finished = false;
+    let exitCode: number | null = null;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const kill = (signal: NodeJS.Signals) => {
+      if (!child.pid) return;
+      try {
+        if (process.platform !== "win32") process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch { /* The process may already have exited. */ }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill("SIGTERM");
+      // Keep escalation alive even if the direct hook exits before descendants.
+      killTimer = setTimeout(() => {
+        kill("SIGKILL");
+        // Escaped descendants may retain pipes; release only our own handles.
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+        finish(exitCode);
+      }, KILL_GRACE_MS);
+    }, TIMEOUT_MS);
 
     const stdout = createHookOutputCollector("stdout");
     const stderr = createHookOutputCollector("stderr");
@@ -104,6 +132,10 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
     child.stdin.on("error", (err) => { stdinError = err.message; });
 
     const finish = (exitCode: number | null, extraErr = "") => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
       if (extraErr) stderr.append(Buffer.from(`\n${extraErr}`, "utf8"));
       resolve({
         fired: true,
@@ -111,13 +143,17 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
         stderr: stderr.text(),
         exitCode,
         ...(stdinError ? { stdinError } : {}),
-        timedOut: child.killed,
+        timedOut,
         durationMs: Date.now() - t0,
       });
     };
 
     child.on("error", (err) => finish(null, err.message));
-    child.on("close", (code) => finish(code));
+    child.on("exit", (code) => { exitCode = code; });
+    child.on("close", (code) => {
+      exitCode = code;
+      if (!timedOut) finish(code);
+    });
 
     child.stdin.write(JSON.stringify(payload));
     child.stdin.end();

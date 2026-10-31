@@ -371,7 +371,11 @@ Optional `.auto/hooks/before.sh` and `.auto/hooks/after.sh` receive a JSON paylo
 stdout is delivered to the agent as bounded steering context. Each hook stream retains at most
 8 KiB of output bytes plus a truncation marker, including stderr from failed hooks. UTF-8
 characters split across output chunks are preserved; a character cut by the byte cap is omitted.
-This bounds retained output, not the hook process itself or its total emitted data. Non-zero exits and timeouts are
+This bounds retained output, not total emitted data. Hooks have a 30-second deadline.
+On timeout, the runner sends TERM and escalates to KILL after 250 ms (to the process
+group on POSIX, or the direct child on Windows). It then releases its own pipe handles
+so an escaped descendant cannot keep the host waiting. This is not process isolation
+and does not guarantee termination of descendants outside that process group. Non-zero exits and timeouts are
 reported and logged rather than hidden. A hook that closes stdin early cannot crash the host with
 a broken-pipe error: detected input-delivery failures are reported in steering context and recorded
 as `stdin_error`, separately from the actual child exit code. Successful writes only confirm pipe
