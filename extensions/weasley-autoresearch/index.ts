@@ -186,6 +186,8 @@ interface LogDetails {
 
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
+  /** Blocks stale host tool registrations after an explicit emergency stop. */
+  stopRequested: boolean;
   /** In-process serialization only; other sessions and external writers are not locked. */
   logInProgress: boolean;
   /** Explicit command-level reconciliation/resume is required after an uncertain keep. */
@@ -781,6 +783,7 @@ function createExperimentState(): ExperimentState {
 function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
+    stopRequested: false,
     logInProgress: false,
     keepReconciliationRequired: false,
     experimentsThisSession: 0,
@@ -1158,17 +1161,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const gatedToolNames = new Set<string>();
   const registerGatedTool = (tool: Parameters<typeof pi.registerTool>[0]): void => {
     gatedToolNames.add(tool.name);
-    pi.registerTool(tool);
+    pi.registerTool({
+      ...tool,
+      async execute(toolCallId, params, signal, onUpdate, ctx) {
+        if (getRuntime(ctx).stopRequested) return {
+          isError: true,
+          content: [{ type: "text", text: "Autoresearch mode OFF. Explicitly resume with /autoresearch <goal> before running experiment tools." }],
+          details: {},
+        };
+        return tool.execute(toolCallId, params, signal, onUpdate, ctx);
+      },
+    });
   };
 
   // The one place mode flips: gated tools follow the flag, never drifting from it.
   const setAutoresearchMode = (ctx: ExtensionContext, enabled: boolean): void => {
-    getRuntime(ctx).autoresearchMode = enabled;
+    const runtime = getRuntime(ctx);
+    if (!enabled) runtime.autoresearchMode = false;
     const activeTools = new Set(pi.getActiveTools()); // setActiveTools replaces the whole set
     for (const tool of gatedToolNames) {
       enabled ? activeTools.add(tool) : activeTools.delete(tool);
     }
     pi.setActiveTools([...activeTools]);
+    if (enabled) {
+      runtime.autoresearchMode = true;
+      runtime.stopRequested = false;
+    }
   };
 
   const recordAutoresearchActivation = (workDir: string, active: boolean): void => {
@@ -3389,18 +3407,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           // A malformed config must never prevent the emergency OFF path.
         }
 
-        recordAutoresearchActivation(workDir, false);
-        setAutoresearchMode(ctx, false);
+        // Stop internal continuation first. Host persistence, tool/UI updates and
+        // abort callbacks are independent best-effort actions: none may prevent
+        // the others from running on the emergency OFF path.
+        runtime.autoresearchMode = false;
+        runtime.stopRequested = true;
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
         invalidateRunEvidence(runtime);
         cancelPendingResume(runtime);
-        stopDashboardServer();
-        clearSessionUi(ctx);
-        if (wasRunning) ctx.abort();
+        const warnings: string[] = [];
+        for (const [label, action] of [
+          ["disable tools", () => setAutoresearchMode(ctx, false)],
+          ["persist session OFF", () => recordAutoresearchActivation(workDir, false)],
+          ["stop dashboard", () => stopDashboardServer()],
+          ["clear session UI", () => clearSessionUi(ctx)],
+          ["abort current run", () => { if (wasRunning) ctx.abort(); }],
+        ] as const) {
+          try { action(); }
+          catch (error) { warnings.push(`Could not ${label}: ${error instanceof Error ? error.message : String(error)}`); }
+        }
+        const message = wasRunning ? "Autoresearch mode OFF — aborting current run" : "Autoresearch mode OFF";
         ctx.ui.notify(
-          wasRunning ? "Autoresearch mode OFF — aborting current run" : "Autoresearch mode OFF",
-          "info"
+          warnings.length ? `${message}\n${warnings.join("\n")}\nInternal automatic continuation is stopped. Verify the host state before restarting; a failed OFF record may not survive a session reload.` : message,
+          warnings.length ? "warning" : "info"
         );
         return;
       }

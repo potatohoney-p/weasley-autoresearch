@@ -120,7 +120,7 @@ async function assertKeepBlocked(h) {
   const calls = h.gitCalls.length;
   const result = await h.call("log_experiment", keep);
   assert.equal(result.details.experiment, undefined, "stale evidence must not authorize a keep");
-  assert.match(text(result), /Cannot keep/);
+  assert.match(text(result), /Cannot keep|Autoresearch mode OFF/);
   assert.equal(h.gitCalls.length, calls);
   assert.equal((await h.git(["rev-parse", "HEAD"])).stdout, head);
   assert.deepEqual(await readFile(join(h.cwd, ".git", "index")), index);

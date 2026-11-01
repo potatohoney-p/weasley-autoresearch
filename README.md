@@ -525,3 +525,12 @@ in observed data-event order,
 so mixed-pipe raw files may not themselves form valid UTF-8. Smaller artifacts
 created only because the LLM display is truncated retain decoded display text. Display retention
 remains bounded and does not promise to retain every diagnostic line.
+
+### Emergency OFF callback failures
+
+`/autoresearch off` stops internal auto-resume and invalidates current run evidence before
+calling host cleanup APIs. Tool deactivation, OFF-record persistence, dashboard/UI cleanup
+and an active-run abort are attempted independently. Failures are reported as warnings;
+stale experiment tool registrations remain blocked in the current runtime until an explicit
+resume. If host persistence or abort fails, verify the host state: this does not guarantee
+termination of an uncooperative host process or durable OFF state across a reload.
