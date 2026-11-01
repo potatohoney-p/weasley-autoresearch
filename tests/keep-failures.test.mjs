@@ -461,6 +461,7 @@ test("pending log rejects other statuses, init, run, clear and restart while off
     release();
   }
   assert.equal((await first).details.state.results.length, 1);
+  await h.commands.get("autoresearch").handler("resume after completed log", h.ctx);
   await h.call("run_experiment", { command: "exit 0" });
   assert.equal((await h.call("log_experiment", keep)).details.state.results.length, 2, "busy lock is released");
 });
