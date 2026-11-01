@@ -206,7 +206,7 @@ interface AutoresearchRuntime {
   } | null;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
   lastRunDuration: number | null;
-  runningExperiment: { startedAt: number; command: string } | null;
+  runningExperiment: { startedAtMonotonic: number; command: string } | null;
   state: ExperimentState;
   /** Pending auto-resume timer; cancelled when the agent starts a new run or compacts. */
   pendingResumeTimer: ReturnType<typeof setTimeout> | null;
@@ -1925,11 +1925,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (signal?.aborted) throw new Error("aborted");
 
       // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
-      runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
+      runtime.runningExperiment = { startedAtMonotonic: performance.now(), command: params.command };
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
 
-      const t0 = Date.now();
+      const t0 = performance.now();
       let progressUpdateFailed = false;
 
       // Spawn the process directly (like the bash tool) for streaming output
@@ -1985,7 +1985,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // Timer interval — update every second with elapsed time + tail output
         const timerInterval = setInterval(() => {
           if (!onUpdate || progressUpdateFailed) return;
-          const elapsed = formatElapsed(Date.now() - t0);
+          const elapsed = formatElapsed(performance.now() - t0);
           const trunc = truncateTail(getBufferText(), {
             maxLines: DEFAULT_MAX_LINES,
             maxBytes: DEFAULT_MAX_BYTES,
@@ -2113,7 +2113,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           finished = true;
           endText("stdout");
           endText("stderr");
-          const completedAt = Date.now();
+          const completedAt = performance.now();
           clearInterval(timerInterval);
           if (timeoutHandle) clearTimeout(timeoutHandle);
           if (escalationHandle) clearTimeout(escalationHandle);
@@ -2191,19 +2191,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const checksPath = autoresearchChecksPath(workDir);
       if (benchmarkPassed && fs.existsSync(checksPath)) {
-        const ct0 = Date.now();
+        const ct0 = performance.now();
         try {
           const checksResult = await pi.exec("bash", [checksPath], {
             signal,
             timeout: checksTimeout,
             cwd: workDir,
           });
-          checksDuration = (Date.now() - ct0) / 1000;
+          checksDuration = (performance.now() - ct0) / 1000;
           checksTimedOut = !!checksResult.killed;
           checksPass = checksResult.code === 0 && !checksResult.killed;
           checksOutput = (checksResult.stdout + "\n" + checksResult.stderr).trim();
         } catch (e) {
-          checksDuration = (Date.now() - ct0) / 1000;
+          checksDuration = (performance.now() - ct0) / 1000;
           checksPass = false;
           checksOutput = e instanceof Error ? e.message : String(e);
         }
@@ -2980,7 +2980,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const buildOverlayContent = (renderWidth: number): string[] => {
             const content = renderDashboardLines(state, renderWidth, theme, 0);
             if (runtime.runningExperiment) {
-              const elapsed = formatElapsed(Date.now() - runtime.runningExperiment.startedAt);
+              const elapsed = formatElapsed(performance.now() - runtime.runningExperiment.startedAtMonotonic);
               const frame = SPINNER[spinnerFrame % SPINNER.length];
               const nextIdx = state.results.length + 1;
               content.push(

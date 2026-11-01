@@ -107,6 +107,9 @@ Timeout remains a failed benchmark even if a termination handler exits zero; cor
 are not run. Cancellation rejects with `aborted`. Output-artifact failure rejects with the original
 persistence error after cleanup, even when benchmark timeout is disabled; it never runs correctness
 checks or reports a partial artifact as successful. Measured duration includes this cleanup grace.
+Benchmark, correctness-check and hook elapsed durations use a monotonic clock, so wall-clock
+adjustments do not produce negative durations or artificial timing jumps. Calendar timestamps
+remain wall-clock based; these elapsed measurements do not imply CPU time or process isolation.
 This is best-effort process cleanup, not a security sandbox or a hard real-time deadline:
 escaped descendants can continue running, Windows cleanup is limited to the direct child, and
 blocking event-loop work or output storage can still delay completion. Hook/check subprocess

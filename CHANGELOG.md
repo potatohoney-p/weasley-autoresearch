@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Use monotonic elapsed time for benchmark, correctness-check and hook durations, preserving
+  calendar timestamps while avoiding false timing jumps after system clock adjustments.
+
 - Kept experiments are published only after a verified Git outcome and successful log append.
   Git errors no longer become successful kept results; uncertain commit or persistence outcomes
   pause the session for explicit reconciliation without retrying or rolling back user work.
