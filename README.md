@@ -138,7 +138,10 @@ Legacy flat `autoresearch.*` session files are read only for compatibility with 
 
 `log_experiment` reports a kept result only after Git has a verified outcome and the JSONL append
 returns successfully. It checks HEAD before staging, accepts only exit 0 (unchanged) or 1 (changed)
-from `git diff --cached --quiet`, and verifies that a successful new commit advances HEAD. A keep
+from `git diff --cached --quiet`, and captures the staged tree with `git write-tree` before committing.
+A successful new commit must advance HEAD, preserve that staged tree, and have the original HEAD
+as its only parent. Hook-staged rewrites or unexpected parent changes require reconciliation;
+the created commits and working files are preserved. This is verification, not an atomic Git lock. A keep
 with no staged changes remains valid and records the verified current HEAD, not a new commit.
 The caller's commit argument does not override this verified hash.
 

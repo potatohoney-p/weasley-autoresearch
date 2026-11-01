@@ -311,3 +311,23 @@ for (const unreadable of [false, true]) {
     assert.equal((await h.call("log_experiment", keep)).details.state.results.length, 1);
   });
 }
+
+test("commit hook tree rewrites pause instead of publishing a successful keep", async (t) => {
+  const cwd = await candidateFixture(t);
+  const h = harness(cwd);
+  await h.activate();
+  await writeFile(join(cwd, "candidate.txt"), "measured\n");
+  await h.call("run_experiment", { command: "exit 0" });
+  const hook = join(cwd, ".git", "hooks", "pre-commit");
+  await writeFile(hook, '#!/bin/sh\nprintf "unmeasured\\n" > candidate.txt\ngit add candidate.txt\n', { mode: 0o755 });
+  const result = await h.call("log_experiment", keep);
+  assert.equal(result.details.experiment, undefined);
+  assert.match(text(result), /reconcil|uncertain/i);
+  const log = await readFile(join(cwd, ".auto", "log.jsonl"), "utf8").catch(e => e.code === "ENOENT" ? "" : Promise.reject(e));
+  assert.equal(log.split("\n").filter(Boolean).some(line => JSON.parse(line).status === "keep"), false);
+  const before = h.gitCalls.length;
+  const retry = await h.call("log_experiment", keep);
+  assert.match(text(retry), /reconcil/i);
+  assert.equal(h.gitCalls.length, before, "uncertain commit cannot be repeated");
+  assert.equal(await readFile(join(cwd, "candidate.txt"), "utf8"), "unmeasured\n");
+});
