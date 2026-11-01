@@ -1769,8 +1769,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       broadcastDashboardUpdate(workDir);
 
       const wasInactive = !runtime.autoresearchMode;
-      recordAutoresearchActivation(workDir, true);
-      setAutoresearchMode(ctx, true);
+      try {
+        recordAutoresearchActivation(workDir, true);
+        setAutoresearchMode(ctx, true);
+      } catch (error) {
+        const pauseWarnings = pauseUncertainKeep(ctx, workDir);
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Experiment config was saved and the new goal is published in memory, but host activation did not confirm success: ${error instanceof Error ? error.message : String(error)}\nAutoresearch is paused. Do not repeat init_experiment. Inspect the saved session config and host activation state, resolve the host failure, then explicitly resume with /autoresearch <goal>.${pauseWarnings}`,
+          }],
+          details: {
+            state: cloneExperimentState(state),
+            initializationOutcome: { persisted: true, activationConfirmed: false, paused: true },
+          },
+          isError: true,
+        };
+      }
       updateWidget(ctx);
 
       if (wasInactive) {
