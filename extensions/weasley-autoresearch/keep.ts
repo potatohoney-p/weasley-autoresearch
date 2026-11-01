@@ -52,6 +52,12 @@ export async function commitKeptCandidate(exec: Exec, cwd: string, message: stri
       }
       return { ok: true, commit, createdCommit: false };
     }
+    phase = "read-staged-tree";
+    const staged = await exec("git", ["write-tree"], options);
+    const expectedTree = staged.stdout.trim();
+    if (staged.killed || staged.code !== 0 || !objectId.test(expectedTree)) {
+      return failure("Could not verify the staged candidate tree before committing.");
+    }
     phase = "commit";
     uncertain = true; // A process failure can happen after Git creates a commit.
     const committed = await exec("git", ["commit", "-m", message], options);
@@ -61,6 +67,15 @@ export async function commitKeptCandidate(exec: Exec, cwd: string, message: stri
     phase = "read-after-head";
     const commit = await readHead();
     if (commit === beforeHead) return failure("git commit reported success but HEAD did not advance.");
+    phase = "verify-committed-tree";
+    // Hooks or concurrent Git operations may change what a successful commit
+    // records. Keep the commit intact, but never publish unverified evidence.
+    const metadata = await exec("git", ["show", "-s", "--no-show-signature", "--no-notes", "--format=%T%n%P", commit], options);
+    const fields = metadata.stdout.trim().split("\n");
+    if (metadata.killed || metadata.code !== 0 || fields.length !== 2 ||
+        fields[0] !== expectedTree || fields[1] !== beforeHead) {
+      return failure("Committed tree or parent does not match the staged candidate and original HEAD; reconcile the preserved commit before continuing.");
+    }
     return { ok: true, commit, createdCommit: true };
   } catch (error) {
     return failure(error instanceof Error ? error.message : String(error));
