@@ -92,7 +92,7 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
   const script = hookScriptPath(payload.cwd, payload.event);
   if (!isExecutableFile(script)) return notFired;
 
-  const t0 = Date.now();
+  const t0 = performance.now();
   return new Promise<HookResult>((resolve) => {
     const child = spawn("bash", [script], { cwd: payload.cwd, timeout: TIMEOUT_MS });
 
@@ -112,7 +112,7 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
         exitCode,
         ...(stdinError ? { stdinError } : {}),
         timedOut: child.killed,
-        durationMs: Date.now() - t0,
+        durationMs: performance.now() - t0,
       });
     };
 
