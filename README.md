@@ -525,3 +525,14 @@ in observed data-event order,
 so mixed-pipe raw files may not themselves form valid UTF-8. Smaller artifacts
 created only because the LLM display is truncated retain decoded display text. Display retention
 remains bounded and does not promise to retain every diagnostic line.
+
+### Initialization activation failures
+
+If the session config is saved but the host activation record or tool-set update throws,
+`init_experiment` returns an error with `initializationOutcome.persisted: true`, retains the
+new goal in memory, and pauses automatic continuation. Do not repeat initialization. Inspect
+the saved config and host activation state, fix the host failure, then explicitly resume with
+`/autoresearch <goal>`. Resume recovers the saved goal without appending another config header.
+The result includes failures to persist the pause or disable host tools; runtime retry guards
+remain active in the current session even when those host callbacks also fail. A failed pause
+record is not a guarantee that a later process restart will remain paused.
