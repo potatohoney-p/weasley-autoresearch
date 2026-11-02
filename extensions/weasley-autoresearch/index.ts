@@ -407,7 +407,7 @@ function computeConfidence(
   segment: number,
   direction: "lower" | "higher"
 ): number | null {
-  const cur = currentResults(results, segment).filter((r) => r.metric > 0);
+  const cur = currentResults(results, segment).filter((r) => r.status !== "crash" && Number.isFinite(r.metric));
   if (cur.length < 3) return null;
 
   const values = cur.map((r) => r.metric);
@@ -423,7 +423,7 @@ function computeConfidence(
   // Find best kept metric in current segment
   let bestKept: number | null = null;
   for (const r of cur) {
-    if (r.status === "keep" && r.metric > 0) {
+    if (r.status === "keep" && Number.isFinite(r.metric)) {
       if (bestKept === null || isBetter(r.metric, bestKept, direction)) {
         bestKept = r.metric;
       }
@@ -862,7 +862,7 @@ function renderDashboardLines(
   for (let i = st.results.length - 1; i >= 0; i--) {
     const r = st.results[i];
     if (r.segment !== st.currentSegment) continue;
-    if (r.status === "keep" && r.metric > 0) {
+    if (r.status === "keep" && Number.isFinite(r.metric)) {
       if (bestPrimary === null || isBetter(r.metric, bestPrimary, st.bestDirection)) {
         bestPrimary = r.metric;
         bestSecondary = r.metrics ?? {};
@@ -906,7 +906,7 @@ function renderDashboardLines(
     let progressLine = `  ${th.fg("muted", "Progress:")} ${th.fg("warning", th.bold(`★ ${st.metricName}: ${formatNum(bestPrimary, st.metricUnit)}`))}${th.fg("dim", ` #${bestRunNum}`)}`;
 
     if (baseline !== null && baseline !== 0 && bestPrimary !== baseline) {
-      const pct = ((bestPrimary - baseline) / baseline) * 100;
+      const pct = ((bestPrimary - baseline) / Math.abs(baseline)) * 100;
       const sign = pct > 0 ? "+" : "";
       const color = isBetter(bestPrimary, baseline, st.bestDirection) ? "success" : "error";
       progressLine += th.fg(color, ` (${sign}${pct.toFixed(1)}%)`);
@@ -1073,7 +1073,7 @@ function renderDashboardLines(
       } else if (
         baselinePrimary !== null &&
         r.status === "keep" &&
-        r.metric > 0
+        Number.isFinite(r.metric)
       ) {
         if (isBetter(r.metric, baselinePrimary, st.bestDirection)) {
           primaryColor = "success";
@@ -2660,9 +2660,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
         if (state.bestMetric !== null) {
           text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
-          if (segmentCount > 1 && params.status === "keep" && params.metric > 0) {
+          if (segmentCount > 1 && params.status === "keep" && Number.isFinite(params.metric) && state.bestMetric !== 0) {
             const delta = params.metric - state.bestMetric;
-            const pct = ((delta / state.bestMetric) * 100).toFixed(1);
+            const pct = ((delta / Math.abs(state.bestMetric)) * 100).toFixed(1);
             const sign = delta > 0 ? "+" : "";
             text += ` | this: ${formatNum(params.metric, state.metricUnit)} (${sign}${pct}%)`;
           }
@@ -2909,7 +2909,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (d.wallClockSeconds !== null && d.wallClockSeconds !== undefined) {
         metricParts.push(`wall: ${d.wallClockSeconds.toFixed(1)}s`);
       }
-      if (exp.metric > 0) {
+      if (exp.status !== "crash" && Number.isFinite(exp.metric)) {
         metricParts.push(`${s.metricName}: ${formatNum(exp.metric, s.metricUnit)}`);
       }
       if (metricParts.length > 0) {
@@ -2923,7 +2923,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // Find the actual best kept metric in the current segment
         let best = s.bestMetric;
         for (const r of s.results) {
-          if (r.segment === s.currentSegment && r.status === "keep" && r.metric > 0) {
+          if (r.segment === s.currentSegment && r.status === "keep" && Number.isFinite(r.metric)) {
             if (isBetter(r.metric, best, s.bestDirection)) best = r.metric;
           }
         }
