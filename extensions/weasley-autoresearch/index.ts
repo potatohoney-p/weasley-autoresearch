@@ -699,13 +699,18 @@ function findBaselineSecondary(
   return base;
 }
 
+function cloneExperimentResult(result: ExperimentResult): ExperimentResult {
+  return {
+    ...result,
+    metrics: { ...result.metrics },
+    ...(result.asi === undefined ? {} : { asi: structuredClone(result.asi) }),
+  };
+}
+
 function cloneExperimentState(state: ExperimentState): ExperimentState {
   return {
     ...state,
-    results: state.results.map((result) => ({
-      ...result,
-      metrics: { ...result.metrics },
-    })),
+    results: state.results.map(cloneExperimentResult),
     secondaryMetrics: state.secondaryMetrics.map((metric) => ({ ...metric })),
   };
 }
@@ -2519,7 +2524,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           };
         }
         const workDir = resolveWorkDir(ctx.cwd);
-        const secondaryMetrics = params.metrics ?? {};
+        const secondaryMetrics = { ...params.metrics };
 
         // A replayed session, interrupted command, or already-consumed result is
         // not evidence that the current working tree passed its benchmark.
@@ -2616,7 +2621,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
         // ASI: agent-supplied free-form diagnostics
         const mergedASI = (params.asi && Object.keys(params.asi).length > 0)
-          ? params.asi as ASI
+          ? structuredClone(params.asi) as ASI
           : undefined;
 
         const experiment: ExperimentResult = {
@@ -2801,7 +2806,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             return {
               content: [{ type: "text", text }],
               details: {
-                experiment: { ...experiment, metrics: { ...experiment.metrics } },
+                experiment: cloneExperimentResult(experiment),
                 state: cloneExperimentState(state),
                 wallClockSeconds,
                 rollbackOutcome: { ok: false, uncertain: true },
@@ -2860,7 +2865,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return {
           content: [{ type: "text", text }],
           details: {
-            experiment: { ...experiment, metrics: { ...experiment.metrics } },
+            experiment: cloneExperimentResult(experiment),
             state: cloneExperimentState(state),
             wallClockSeconds,
           } as LogDetails,
