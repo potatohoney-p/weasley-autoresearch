@@ -184,6 +184,15 @@ It does not lock other sessions or external writers, guarantee physical durabili
 automatically after process death. A different session has no new persisted uncertainty marker.
 Discard/crash rollback behavior is unchanged.
 
+### Result snapshots
+
+Logging copies supplied secondary metrics and nested JSON-compatible ASI diagnostics
+before asynchronous Git publication. Returned experiment and state objects are detached
+snapshots: changing input objects or returned diagnostics cannot rewrite the runtime's
+recorded history or later hook payloads. This also applies when restoring state from
+legacy tool-result history. It does not freeze caller objects or make Git and JSONL an
+atomic transaction; the persisted log remains the source for recovery.
+
 ## Configuration
 
 `.auto/config.json` accepts exactly these optional fields:

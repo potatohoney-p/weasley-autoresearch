@@ -337,3 +337,45 @@ for (const status of ['discard', 'crash', 'checks_failed']) {
     assert.equal(logged.details.experiment?.metric, 0);
   });
 }
+
+for (const status of ['keep', 'discard', 'crash', 'checks_failed']) {
+  for (const source of ['input', 'experiment', 'state']) {
+    test(`${status} isolates nested diagnostics and metrics from ${source} mutation`, async t => {
+      const h = await fixture(t);
+      await h.run();
+      const input = { ...keep, status, metrics: { throughput: 2 }, asi: { hypothesis: { steps: ['original'], evidence: { valid: true } } } };
+      const result = await h.call('log_experiment', input);
+      assert.equal(result.details.experiment.status, status);
+      const original = JSON.parse(JSON.stringify(result.details.experiment));
+      const log = join(h.cwd, '.auto', 'log.jsonl');
+      const persisted = await readFile(log, 'utf8');
+      const target = source === 'input' ? input : source === 'experiment' ? result.details.experiment : result.details.state.results[0];
+      target.metrics.throughput = 999;
+      target.asi.hypothesis.steps.push('rewritten');
+      target.asi.hypothesis.evidence.valid = false;
+      assert.equal(await readFile(log, 'utf8'), persisted);
+      await h.run();
+      const next = await h.call('log_experiment', { ...keep, metrics: { throughput: 2 } });
+      assert.deepEqual(next.details.state.results[0], original, 'published history must match its original persisted evidence');
+    });
+  }
+}
+
+test('keep snapshots metric and diagnostic input before asynchronous Git publication', async t => {
+  const h = await fixture(t);
+  await h.run();
+  const input = { ...keep, metrics: { throughput: 2 }, asi: { hypothesis: { evidence: ['original'] } } };
+  const hold = h.holdGit();
+  const pending = h.call('log_experiment', input);
+  await hold.started.promise;
+  input.metrics.throughput = 99;
+  input.asi.hypothesis.evidence.push('late mutation');
+  hold.release.resolve();
+  const result = await pending;
+  assert.equal(result.details.experiment.metrics.throughput, 2);
+  assert.deepEqual(result.details.experiment.asi, { hypothesis: { evidence: ['original'] } });
+  const records = (await readFile(join(h.cwd, '.auto', 'log.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  const recorded = records.find(record => record.status === 'keep');
+  assert.equal(recorded.metrics.throughput, 2);
+  assert.deepEqual(recorded.asi, { hypothesis: { evidence: ['original'] } });
+});
