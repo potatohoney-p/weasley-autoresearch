@@ -525,3 +525,10 @@ in observed data-event order,
 so mixed-pipe raw files may not themselves form valid UTF-8. Smaller artifacts
 created only because the LLM display is truncated retain decoded display text. Display retention
 remains bounded and does not promise to retain every diagnostic line.
+
+### Signed metric reporting
+
+Zero and negative finite primary measurements are valid for kept results. Progress and
+confidence include them; crash placeholders do not contribute to the confidence noise
+estimate. Primary percentage changes use the absolute baseline magnitude and are omitted
+when the baseline is zero. This reporting does not establish statistical significance.
