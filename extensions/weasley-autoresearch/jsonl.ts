@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+
 export type JsonlEntry = Record<string, unknown>;
 
 export interface AutoresearchConfigEntry extends JsonlEntry {
@@ -187,4 +189,42 @@ export function reconstructJsonlState(jsonlContent: string): ReconstructedJsonlS
   }
 
   return state;
+}
+
+/** Append without joining a new record to a valid final record lacking a newline.
+ * This checks only the boundary, not the whole log, and is not a writer lock.
+ */
+export function appendJsonlRecord(file: string, record: string): void {
+  let separator = "";
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, "r");
+    let position = fs.fstatSync(fd).size;
+    if (position > 0) {
+      const last = Buffer.alloc(1);
+      if (fs.readSync(fd, last, 0, 1, position - 1) !== 1) throw new Error("Log changed while reading append boundary");
+      if (last[0] !== 10) {
+        const chunks: Buffer[] = [];
+        while (position > 0) {
+          const size = Math.min(position, 65536);
+          position -= size;
+          const chunk = Buffer.alloc(size);
+          if (fs.readSync(fd, chunk, 0, size, position) !== size) throw new Error("Log changed while reading append boundary");
+          const newline = chunk.lastIndexOf(10);
+          chunks.unshift(newline < 0 ? chunk : chunk.subarray(newline + 1));
+          if (newline >= 0) break;
+        }
+        const tail = Buffer.concat(chunks).toString("utf8");
+        if (tail.trim() && !parseJsonlEntry(tail)) {
+          throw new Error("Cannot append after an incomplete or non-object JSONL record; reconcile the log first");
+        }
+        separator = "\n";
+      }
+    }
+  } catch (error) {
+    if (fd !== undefined || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+  fs.appendFileSync(file, separator + record + "\n");
 }

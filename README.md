@@ -525,3 +525,13 @@ in observed data-event order,
 so mixed-pipe raw files may not themselves form valid UTF-8. Smaller artifacts
 created only because the LLM display is truncated retain decoded display text. Display retention
 remains bounded and does not promise to retain every diagnostic line.
+
+### JSONL append boundaries
+
+Config, experiment and hook entries preserve a complete final JSON object even when
+an imported or edited log lacks its final newline. Appending inserts the missing
+separator before the new record. An unterminated malformed or non-object tail is
+not repaired or overwritten. Normal newline-terminated appends read only the final
+byte; an unterminated tail is scanned backward to its preceding newline.
+This boundary check is not whole-log validation, a writer lock, or an atomic
+transaction with Git. Existing persistence-error reconciliation rules still apply.

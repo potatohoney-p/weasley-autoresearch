@@ -337,3 +337,20 @@ for (const status of ['discard', 'crash', 'checks_failed']) {
     assert.equal(logged.details.experiment?.metric, 0);
   });
 }
+
+for (const action of ['keep', 'reinitialize']) {
+ test(`preserves complete unterminated JSONL tail before ${action}`, async t=>{
+  const h=await fixture(t);
+  const log=join(h.cwd,'.auto','log.jsonl');
+  const before=(await readFile(log,'utf8')).trimEnd();
+  await writeFile(log,before);
+  if(action==='keep') { await h.run(); await h.call('log_experiment',keep); }
+  else await h.call('init_experiment',{name:'next',metric_name:'latency'});
+  const after=await readFile(log,'utf8');
+  assert.ok(after.startsWith(before+'\n'),'preserve original record with a separator');
+  const records=after.trim().split('\n').map(JSON.parse);
+  assert.equal(records.length,2);
+  assert.equal(records[0].type,'config');
+  assert.equal(action==='keep'?records[1].status:records[1].name,action==='keep'?'keep':'next');
+ });
+}

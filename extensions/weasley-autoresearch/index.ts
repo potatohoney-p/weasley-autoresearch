@@ -43,6 +43,7 @@ import {
 } from "./hooks.ts";
 import {
   parseJsonlEntry,
+  appendJsonlRecord,
   isAutoresearchRunEntry,
   extractAutoresearchSessionName,
   reconstructJsonlState,
@@ -1749,7 +1750,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           bestDirection: nextState.bestDirection,
         });
         if (fs.existsSync(jsonlPath)) {
-          fs.appendFileSync(jsonlPath, config + "\n");
+          appendJsonlRecord(jsonlPath, config);
         } else {
           fs.writeFileSync(jsonlPath, config + "\n");
         }
@@ -2756,7 +2757,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         try {
           const jsonlPath = autoresearchJsonlPath(workDir);
           ensureParentDir(jsonlPath);
-          fs.appendFileSync(jsonlPath, jsonlLine + "\n");
+          appendJsonlRecord(jsonlPath, jsonlLine);
         } catch (e) {
           if (params.status === "keep") {
             const pauseWarnings = pauseUncertainKeep(ctx, workDir);
