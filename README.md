@@ -1,4 +1,4 @@
-﻿# Weasley AutoResearch
+# Weasley AutoResearch
 
 ![Weasley AutoResearch: experiment, measure, keep the winners](assets/weasley-autoresearch-hero.png)
 
