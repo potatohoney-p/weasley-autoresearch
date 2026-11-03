@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Session startup and tree navigation pause when the persisted log cannot be read instead of
+  reactivating stale tool-result history. Failed recovery blocks queued experiment tools and
+  automatic continuation until the log is repaired and explicitly resumed; genuinely missing
+  logs retain legacy fallback. Dangling log/layout links cannot expose stale legacy peers.
+
 - Kept experiments are published only after a verified Git outcome and successful log append.
   Git errors no longer become successful kept results; uncertain commit or persistence outcomes
   pause the session for explicit reconciliation without retrying or rolling back user work.
