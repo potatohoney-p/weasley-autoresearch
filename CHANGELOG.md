@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Large persisted histories no longer exceed the JavaScript argument limit when preparing hook
+  snapshots, preserving activation and the successful return of already-recorded experiments.
+
 - Kept experiments are published only after a verified Git outcome and successful log append.
   Git errors no longer become successful kept results; uncertain commit or persistence outcomes
   pause the session for explicit reconciliation without retrying or rolling back user work.

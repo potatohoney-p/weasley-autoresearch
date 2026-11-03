@@ -636,11 +636,15 @@ function findBestMetric(
   segment: number,
   direction: "lower" | "higher",
 ): number | null {
-  const kept = currentResults(results, segment)
-    .filter((r) => r.status === "keep")
-    .map((r) => r.metric);
-  if (kept.length === 0) return null;
-  return direction === "lower" ? Math.min(...kept) : Math.max(...kept);
+  // Persisted histories are not bounded by the current session's turn limit.
+  // Keep each call's arity constant rather than spreading history into arguments.
+  let best: number | null = null;
+  for (const result of results) {
+    if (result.segment !== segment || result.status !== "keep") continue;
+    best = best === null ? result.metric
+      : direction === "lower" ? Math.min(best, result.metric) : Math.max(best, result.metric);
+  }
+  return best;
 }
 
 // -----------------------------------------------------------------------
