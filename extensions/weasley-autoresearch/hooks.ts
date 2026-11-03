@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 
-import { hasAutoresearchConfigHeader } from "./jsonl.ts";
+import { hasAutoresearchConfigHeader, appendJsonlRecord } from "./jsonl.ts";
 import { hookScriptPath } from "./paths.ts";
 
 const TIMEOUT_MS = 30_000;
@@ -175,7 +175,7 @@ export function appendHookLogEntryIfConfigured(
   if (!hasConfigHeader(jsonlPath)) return false;
 
   try {
-    fs.appendFileSync(jsonlPath, JSON.stringify(hookLogEntry(stage, result)) + "\n");
+    appendJsonlRecord(jsonlPath, JSON.stringify(hookLogEntry(stage, result)));
     return true;
   } catch {
     return false;
