@@ -310,33 +310,25 @@ export const LogParams = Type.Object({
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Format a number with comma-separated thousands: 15586 → "15,586" */
-function commas(n: number): string {
-  const s = String(Math.round(n));
-  const parts: string[] = [];
-  for (let i = s.length; i > 0; i -= 3) {
-    parts.unshift(s.slice(Math.max(0, i - 3), i));
-  }
-  return parts.join(",");
-}
+const integerFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+const fractionalFormat = new Intl.NumberFormat("en-US", {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
 
-/** Format number with commas, preserving one decimal for fractional values */
-function fmtNum(n: number, decimals: number = 0): string {
-  if (decimals > 0) {
-    const int = Math.floor(Math.abs(n));
-    const frac = (Math.abs(n) - int).toFixed(decimals).slice(1); // ".3"
-    return (n < 0 ? "-" : "") + commas(int) + frac;
-  }
-  return commas(n);
-}
-
+/** Display hints only; persisted and machine-ready measurements stay unchanged. */
 function formatNum(value: number | null, unit: string): string {
   if (value === null) return "—";
-  const u = unit || "";
-  // Integers: no decimals
-  if (value === Math.round(value)) return fmtNum(value) + u;
-  // Fractional: 2 decimal places
-  return fmtNum(value, 2) + u;
+  const magnitude = Math.abs(value);
+  // Keep nonzero small values visible and avoid hundreds of digits for large
+  // values. String also leaves exponent notation intact instead of grouping it.
+  if ((magnitude > 0 && magnitude < 0.01) || magnitude >= 1e21) {
+    return String(value) + (unit || "");
+  }
+  // Round the complete number so fractional carry and the minus sign cannot
+  // be detached from the grouped integer portion.
+  const formatter = Number.isInteger(value) ? integerFormat : fractionalFormat;
+  return formatter.format(value === 0 ? 0 : value) + (unit || "");
 }
 
 /** Lazy temp file allocator — returns the same path on subsequent calls */
