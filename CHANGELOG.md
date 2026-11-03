@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Coalesce live-dashboard notifications while a browser connection is backpressured, then
+  send the newest update on drain instead of growing the response buffer without bound.
+  Closed or failed clients are retired without interrupting experiments or healthy clients.
+
 - Kept experiments are published only after a verified Git outcome and successful log append.
   Git errors no longer become successful kept results; uncertain commit or persistence outcomes
   pause the session for explicit reconciliation without retrying or rolling back user work.

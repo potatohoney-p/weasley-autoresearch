@@ -3158,7 +3158,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promise: Promise<number>;
     reject: (error: Error) => void;
   } | null = null;
-  const dashboardSseClients = new Set<ServerResponse>();
+  const dashboardSseClients = new Map<ServerResponse, {
+    send: (message: string) => void;
+    close: () => void;
+  }>();
 
   function openInBrowser(url: string): void {
     const child = process.platform === "win32"
@@ -3185,9 +3188,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       pending.reject(new Error("Dashboard export cancelled"));
       try { pending.server.close(); } catch { /* ignore */ }
     }
-    for (const client of dashboardSseClients) {
-      try { client.end(); } catch { /* ignore */ }
-    }
+    for (const client of dashboardSseClients.values()) client.close();
     dashboardSseClients.clear();
 
     if (dashboardServer) {
@@ -3233,26 +3234,69 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   function registerSseClient(res: ServerResponse): void {
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    });
-    res.write("retry: 1000\n\n");
-    dashboardSseClients.add(res);
-    res.on("close", () => dashboardSseClients.delete(res));
+    let closed = false;
+    let blocked = false;
+    let pending: string | null = null;
+
+    const retire = (): void => {
+      if (closed) return;
+      closed = true;
+      pending = null;
+      dashboardSseClients.delete(res);
+      res.off("drain", onDrain);
+    };
+    const fail = (): void => {
+      retire();
+      try { res.destroy(); } catch { /* The response is already unusable. */ }
+    };
+    const send = (message: string): void => {
+      if (closed) return;
+      if (res.destroyed || res.writableEnded) {
+        retire();
+        return;
+      }
+      if (blocked) {
+        // Events invalidate the whole log, so only the newest notification is
+        // needed. Never append more data to a backpressured response buffer.
+        pending = message;
+        return;
+      }
+      try { blocked = !res.write(message); }
+      catch { fail(); }
+    };
+    const onDrain = (): void => {
+      blocked = false;
+      if (pending !== null) {
+        const message = pending;
+        pending = null;
+        send(message);
+      }
+    };
+    const close = (): void => {
+      retire();
+      try { res.end(); } catch { fail(); }
+    };
+
+    // Observe the lifecycle before the initial retry write, which can itself
+    // apply pressure or fail. Keep errors handled even after retirement.
+    res.on("drain", onDrain);
+    res.once("close", retire);
+    res.on("error", fail);
+    dashboardSseClients.set(res, { send, close });
+    try {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      send("retry: 1000\n\n");
+    } catch { fail(); }
   }
 
   function broadcastDashboardUpdate(workDir: string): void {
     if (!dashboardServer || dashboardServerWorkDir !== workDir) return;
-    for (const res of dashboardSseClients) {
-      try {
-        res.write("event: jsonl-updated\n");
-        res.write(`data: ${Date.now()}\n\n`);
-      } catch {
-        dashboardSseClients.delete(res);
-      }
-    }
+    const message = `event: jsonl-updated\ndata: ${Date.now()}\n\n`;
+    for (const client of dashboardSseClients.values()) client.send(message);
   }
 
   function startStaticServer(workDir: string, dashboardHtmlPath: string): Promise<number> {
