@@ -188,7 +188,7 @@ interface AutoresearchRuntime {
   autoresearchMode: boolean;
   /** In-process serialization only; other sessions and external writers are not locked. */
   logInProgress: boolean;
-  /** Explicit command-level reconciliation/resume is required after an uncertain keep. */
+  /** Explicit reconciliation/resume is required after uncertain writes or failed log recovery. */
   keepReconciliationRequired: boolean;
   experimentsThisSession: number;
   autoResumeTurns: number;
@@ -358,6 +358,40 @@ function formatElapsed(ms: number): string {
   const s = totalSec % 60;
   if (m > 0) return `${m}m ${String(s).padStart(2, "0")}s`;
   return `${s}s`;
+}
+
+/** Read authoritative persisted history; only a truly absent log permits legacy fallback. */
+function readPersistedSessionLog(workDir: string): string | null {
+  let sourcePath = path.join(workDir, AUTO_DIR);
+  const presence = new Map<string, boolean>();
+  const exists = (filePath: string): boolean => {
+    sourcePath = filePath;
+    if (presence.has(filePath)) return presence.get(filePath)!;
+    try {
+      fs.lstatSync(filePath);
+      presence.set(filePath, true);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      presence.set(filePath, false);
+      return false;
+    }
+  };
+  try {
+    const currentDir = path.join(workDir, AUTO_DIR);
+    // A broken layout link (or a non-directory) must not reveal stale legacy peers.
+    if (exists(currentDir) && !fs.statSync(currentDir).isDirectory()) {
+      throw new Error("The current session layout is not a directory.");
+    }
+    const jsonlPath = sessionFilePath(workDir, "log", exists);
+    // Reuse path-selection observations: once present, a disappearing log must
+    // fail at read time, not become permission to resurrect stale tool history.
+    if (!exists(jsonlPath)) return null;
+    return fs.readFileSync(jsonlPath, "utf8");
+  } catch (cause) {
+    // Do not echo file contents or arbitrary filesystem error messages.
+    throw new Error(`Unable to read persisted session log: ${sourcePath}. Repair it before explicitly resuming.`, { cause });
+  }
 }
 
 /** Kill a process tree (best effort, tries process group first) */
@@ -1422,12 +1456,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const workDir = resolveWorkDir(ctx.cwd);
 
     // Primary: read from .auto/log.jsonl (alongside .auto/prompt.md and .auto/measure.sh)
-    const jsonlPath = autoresearchJsonlPath(workDir);
-    const hasPersistedLog = fs.existsSync(jsonlPath);
+    let hasPersistedLog = false;
     let loadedFromJsonl = false;
     try {
-      if (hasPersistedLog) {
-        const reconstructed = reconstructJsonlState(fs.readFileSync(jsonlPath, "utf-8"));
+      const persisted = readPersistedSessionLog(workDir);
+      hasPersistedLog = persisted !== null;
+      if (persisted !== null) {
+        const reconstructed = reconstructJsonlState(persisted);
         state.name = reconstructed.name;
         state.metricName = reconstructed.metricName;
         state.metricUnit = reconstructed.metricUnit;
@@ -1447,11 +1482,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
         }
       }
-    } catch {
-      // Fall through to session history
+    } catch (error) {
+      // A present but unreadable log is authoritative. Never resurrect stale
+      // tool-result history or allow queued tools to mutate this unknown state.
+      const warnings = pauseUncertainKeep(ctx, workDir);
+      try { clearSessionUi(ctx); } catch { /* The runtime guard already holds. */ }
+      try {
+        ctx.ui.notify(`Autoresearch recovery paused: ${error instanceof Error ? error.message : "Unable to read persisted session log."}${warnings}`, "error");
+      } catch { /* Notification failures cannot bypass the recovery guard. */ }
+      return;
     }
 
-    // Fallback: reconstruct from session history (backward compat)
+    // Fallback: reconstruct from session history only when no log exists.
     if (!loadedFromJsonl) {
       for (const entry of ctx.sessionManager.getBranch()) {
         if (entry.type !== "message") continue;
@@ -1492,7 +1534,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       recordedActivationDecision(ctx, workDir),
     );
     const activationError = shouldActivate ? worktreeActivationError(workDir) : null;
-    setAutoresearchMode(ctx, shouldActivate && !activationError);
+    // Re-reading repaired bytes does not replace an explicit reconciliation.
+    setAutoresearchMode(ctx, shouldActivate && !activationError && !runtime.keepReconciliationRequired);
     if (activationError && ctx.hasUI) {
       ctx.ui.notify(`Autoresearch disabled: ${activationError}`, "error");
     }
@@ -3478,7 +3521,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         try {
           // Explicit resume reads the user's reconciled log, never stale tool history.
           // Do not repair/truncate bytes or silently skip a partially appended line.
-          const content = fs.readFileSync(autoresearchJsonlPath(workDir), "utf8");
+          const content = readPersistedSessionLog(workDir);
+          if (content === null) throw new Error("No persisted session log is available for reconciliation.");
           if (content && !content.endsWith("\n")) throw new Error("The log must end with a newline before another append.");
           for (const line of content.split("\n")) {
             if (line.trim() && !parseJsonlEntry(line)) throw new Error("Every nonempty log line must be a complete JSON object.");

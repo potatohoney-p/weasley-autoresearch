@@ -119,8 +119,12 @@ All current session artifacts live under `.auto/` in the effective working direc
 On startup or session-tree navigation, a successfully read session log takes precedence over
 historical tool results, including an empty or config-only log. Clearing a session and initializing
 a new goal therefore does not restore the old goal or baseline before the first new result.
-Missing or unreadable logs retain the legacy history fallback; this does not validate or repair
-damaged logs.
+A genuinely missing log retains the legacy history fallback without automatic activation.
+An unreadable persisted log pauses recovery and blocks experiment tools and automatic continuation,
+including when a log disappears after it was found. Dangling log or layout links do not select stale
+legacy files. Repair the source, then explicitly resume with `/autoresearch <goal>`; reloading the
+session alone does not clear the current process's recovery guard. Recovery does not repair log bytes
+or validate every record's schema, and it is not an atomic snapshot against concurrent writers.
 
 | File | Purpose |
 |---|---|
