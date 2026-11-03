@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Metric display rounds the whole number before grouping, preserving rounding carry and minus
+  signs. Small nonzero values stay visible, and large values retain valid scientific notation.
+  Stored measurements and machine-ready values are unchanged.
+
 - Kept experiments are published only after a verified Git outcome and successful log append.
   Git errors no longer become successful kept results; uncertain commit or persistence outcomes
   pause the session for explicit reconciliation without retrying or rolling back user work.

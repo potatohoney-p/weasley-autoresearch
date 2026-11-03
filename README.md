@@ -11,6 +11,9 @@ reverts regressions while preserving an auditable session log. The published pac
 
 - `init_experiment`, `run_experiment`, and `log_experiment` tools for measured iteration.
 - Live terminal widget, fullscreen dashboard, confidence scoring, and JSONL session history.
+  Metric labels group ordinary values and round fractional values to two decimals; nonzero
+  magnitudes below 0.01 and magnitudes at least 1e21 retain their numeric string representation.
+  These labels are display hints; JSONL and machine-ready values retain the measurements.
 - Correctness backpressure through optional `.auto/checks.sh`.
 - Before/after hooks for research context, notifications, and learning journals.
 - Automatic continuation across agent turns and context compaction, with bounded safety guards. Compaction summaries preserve finite benchmark metric values without rounding away small differences; percentage deltas remain rounded display hints.
