@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Configuration lookup now distinguishes absent settings from unreadable paths, dangling
+  links and broken `.auto` layouts, preserving fail-closed working-directory and iteration
+  policy instead of silently selecting defaults or stale legacy settings.
 - Kept experiments are published only after a verified Git outcome and successful log append.
   Git errors no longer become successful kept results; uncertain commit or persistence outcomes
   pause the session for explicit reconciliation without retrying or rolling back user work.
