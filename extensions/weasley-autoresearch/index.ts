@@ -64,6 +64,7 @@ import { MetricCollector, metricLimitWarning, type MetricLimit } from "./metrics
 // ---------------------------------------------------------------------------
 const EXPERIMENT_MAX_LINES = 10;
 const EXPERIMENT_MAX_BYTES = 4 * 1024; // 4KB
+const CHECKS_MAX_LINES = 80;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -163,6 +164,8 @@ interface RunDetails {
   checksPass: boolean | null;
   checksTimedOut: boolean;
   checksOutput: string;
+  /** Metadata only; never retain a second copy of the diagnostic text. */
+  checksTruncation?: Omit<ReturnType<typeof truncateTail>, "content">;
   checksDuration: number;
   /** Optional synchronous progress delivery failed; execution results remain authoritative. */
   progressUpdateFailed?: boolean;
@@ -2210,6 +2213,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       assertCurrentRun();
+      // Line limits alone do not bound a single long diagnostic. Keep only a
+      // UTF-8-safe tail in the result and run evidence; the host still owns
+      // subprocess capture, so this does not bound memory during pi.exec.
+      const { content: checksTail, ...checksTruncation } = truncateTail(checksOutput, {
+        maxLines: CHECKS_MAX_LINES,
+        maxBytes: EXPERIMENT_MAX_BYTES,
+      });
+      checksOutput = checksTail;
       // Snapshot work stays outside benchmark/check duration measurements.
       let provenanceError: string | null = null;
       if (benchmarkPassed && checksPass !== false) {
@@ -2260,7 +2271,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         tailOutput: displayTruncation.content,
         checksPass,
         checksTimedOut,
-        checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
+        checksOutput,
+        ...(checksTruncation.truncated ? { checksTruncation } : {}),
         checksDuration,
         ...(progressUpdateFailed ? { progressUpdateFailed: true } : {}),
         parsedMetrics,
@@ -2339,7 +2351,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (checksPass === false) {
-        text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
+        text += `\n\n── Checks output ──\n${details.checksOutput}`;
+      }
+      if (checksTruncation.truncated) {
+        text += `\n\n[Checks output truncated: retained ${checksTruncation.outputLines} of ${checksTruncation.totalLines} lines, ${checksTruncation.outputBytes} of ${checksTruncation.totalBytes} bytes. Limit: ${CHECKS_MAX_LINES} lines / ${formatSize(EXPERIMENT_MAX_BYTES)}; earlier diagnostics omitted.]`;
       }
 
       // Publish only after the current call has finished preparing its result.
@@ -2394,13 +2409,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       // Helper: append tail output preview or full output
-      const appendOutput = (text: string, output: string): string => {
+      const appendOutput = (text: string, output: string, isChecksOutput = false): string => {
+        if (isChecksOutput && d.checksTruncation) text += "\n" + theme.fg("warning", "Checks output truncated; showing retained tail.");
         const warning = metricLimitWarning(d.metricLimits ?? []);
         if (warning) text += "\n" + theme.fg("warning", warning);
         if (!output) return text;
         const lines = output.split("\n");
         if (expanded) {
-          text += "\n" + theme.fg("dim", output.slice(-2000));
+          const tail = isChecksOutput
+            ? truncateTail(output, { maxLines: CHECKS_MAX_LINES, maxBytes: 2000 }).content
+            : output.slice(-2000);
+          text += "\n" + theme.fg("dim", tail);
         } else {
           const tail = lines.slice(-PREVIEW_LINES).join("\n");
           if (tail.trim()) {
@@ -2430,7 +2449,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           theme.fg("success", `✅ wall: ${d.durationSeconds.toFixed(1)}s`) +
           parsedSuffix +
           theme.fg("error", ` ⏰ checks timeout ${d.checksDuration.toFixed(1)}s`);
-        text = appendOutput(text, d.checksOutput);
+        text = appendOutput(text, d.checksOutput, true);
         return new Text(text, 0, 0);
       }
 
@@ -2439,7 +2458,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           theme.fg("success", `✅ wall: ${d.durationSeconds.toFixed(1)}s`) +
           parsedSuffix +
           theme.fg("error", ` 💥 checks failed ${d.checksDuration.toFixed(1)}s`);
-        text = appendOutput(text, d.checksOutput);
+        text = appendOutput(text, d.checksOutput, true);
         return new Text(text, 0, 0);
       }
 
@@ -2552,7 +2571,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           return {
             content: [{
               type: "text",
-              text: `❌ Cannot keep — .auto/checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
+              text: `❌ Cannot keep — .auto/checks.sh failed.\n\n${truncateTail(runtime.lastRunChecks.output, { maxLines: CHECKS_MAX_LINES, maxBytes: 500 }).content}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
             }],
             details: {},
           };
