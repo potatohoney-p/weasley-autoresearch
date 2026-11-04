@@ -80,6 +80,13 @@ working directory replaces the old server. A later explicit export can start a f
 This lifecycle is extension-wide (not one server per session); it does not change session switching,
 request validation, dashboard temporary-file retention, or browser windows already opened.
 
+The exported browser dashboard shows the latest experiment segment. Each config header
+resets its baseline, rows, chart and share-card data, so goals with different metrics or
+optimization directions are not compared. A newly initialized segment displays zero runs
+until its first result arrives. Earlier segments remain in the unchanged JSONL log. JSONL,
+ordered JSON arrays and `entries` documents preserve these boundaries; `config`/`runs`
+documents remain supported as single-segment input.
+
 The shortcut can be changed or disabled in the active Pi agent directory at
 `<agent-dir>/extensions/weasley-autoresearch.json`. The default agent directory is
 `~/.pi/agent`; `PI_CODING_AGENT_DIR` can override it.
