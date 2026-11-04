@@ -22,6 +22,8 @@ reverts regressions while preserving an auditable session log. The published pac
   falling back to a different directory or iteration policy.
 - Local repeated-benchmark runner with separate warmups, median metrics, and optional per-trial
   JSON evidence. Failed or incomplete series never emit aggregate metrics.
+- Read-only comparison of repeated-benchmark reports with validated samples, directional deltas,
+  and warnings when recorded experimental conditions differ.
 
 ## Progress delivery failures
 
@@ -437,6 +439,40 @@ report before sharing it. Keep reports under `.auto/` (or ignored paths) so they
 candidate provenance. This captures observations, not an exact environment/input snapshot or
 proof of reproducibility. Serial trials are not guaranteed independent, and median/MAD are
 descriptive statistics, not a confidence interval or significance test.
+### Compare baseline and candidate reports
+
+Use two successful repeated-benchmark reports to inspect an improvement without rerunning the
+workload or changing the experiment log:
+
+```bash
+./node_modules/.bin/weasley-compare --baseline .auto/baseline.json \
+  --candidate .auto/candidate.json --direction lower
+```
+
+From a source checkout, use `node bin/compare-benchmarks.mjs` with the same arguments. Direction
+is required: `lower` for latency/cost, or `higher` for throughput/scores. Stdout is a JSON object
+with the primary metric's sample counts, median, MAD and range for both reports, the directional
+`outcome` (`improved`, `regressed`, or `unchanged`), `change` (candidate minus baseline),
+`changePercent`, and `improvementPercent` (positive means better for the chosen direction).
+Percentages use the absolute baseline magnitude. A zero baseline has no percentage; a numeric
+result outside the finite range is `null` with an explicit warning.
+
+The comparator accepts schema-version-1 reports from `weasley-benchmark`. It checks successful
+completion, every planned trial and count, sample order, exit status, finite metrics, consistent
+metric sets within each series, and every stored summary against the underlying samples. Failed,
+partial or inconsistent reports produce no comparison. The primary metric must match between
+reports. Different commands, working directories, recorded Node/platform/architecture, run counts,
+warmups, timeouts, or secondary metric sets produce warnings, not silent equivalence. Inputs must
+be regular UTF-8 JSON files, at most 16 MiB each; they are never modified. The command does not run
+workloads or emit `METRIC` records. Exit 0 means a valid comparison, even for a regression; invalid
+arguments exit 2, and unreadable or invalid reports exit 1.
+
+This is a **descriptive comparison**, not statistical significance, verified reproducibility, or
+an automatic keep/discard decision. Matching metadata does not establish matching inputs or
+independent samples; small/noisy changes still need controlled reruns and correctness checks.
+Validation detects inconsistent evidence, not fabricated or self-consistently edited reports.
+Keep using `run_experiment` and `log_experiment` for guarded publication.
+
 ### Compaction source failures
 
 Active AutoResearch compaction is canceled if an existing log, rules, or ideas

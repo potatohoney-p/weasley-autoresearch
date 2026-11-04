@@ -14,7 +14,8 @@
   },
   "type": "module",
   "bin": {
-    "weasley-benchmark": "bin/repeat-benchmark.mjs"
+    "weasley-benchmark": "bin/repeat-benchmark.mjs",
+    "weasley-compare": "bin/compare-benchmarks.mjs"
   },
   "keywords": [
     "pi-package",
