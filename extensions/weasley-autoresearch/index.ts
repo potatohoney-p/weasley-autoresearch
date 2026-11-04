@@ -1354,8 +1354,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     goal: state.name ?? "",
   });
 
-  const fireHook = async (payload: HookPayload): Promise<string | null> => {
+  // A hook may outlive OFF, reinitialization or a session switch. Its result
+  // belongs to the captured session generation, not whichever session is live
+  // when the subprocess eventually closes.
+  const hookContinuationFor = (ctx: ExtensionContext): (() => boolean) => {
+    const sessionKey = getSessionKey(ctx);
+    const runtime = getRuntime(ctx);
+    const generation = runtime.runGeneration;
+    return () => getSessionKey(ctx) === sessionKey &&
+      runtime.runGeneration === generation && runtime.autoresearchMode;
+  };
+
+  const fireHook = async (payload: HookPayload, canContinue: () => boolean): Promise<string | null> => {
+    if (!canContinue()) return null;
     const result = await runHook(payload);
+    if (!canContinue()) return null;
     appendHookLogEntryIfConfigured(autoresearchJsonlPath(payload.cwd), payload.event, result);
     return steerMessageFor(payload.event, result);
   };
@@ -1773,6 +1786,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       setAutoresearchMode(ctx, true);
       updateWidget(ctx);
 
+      const canContinue = hookContinuationFor(ctx);
       if (wasInactive) {
         const steer = await fireHook({
           event: "before",
@@ -1780,8 +1794,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           next_run: state.results.length + 1,
           last_run: readLastRun(workDir),
           session: buildSessionSnapshot(state),
-        });
-        if (steer) pi.sendUserMessage(steer, { deliverAs: "steer" });
+        }, canContinue);
+        if (steer && canContinue()) pi.sendUserMessage(steer, { deliverAs: "steer" });
       }
 
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
@@ -1790,7 +1804,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to .auto/log.jsonl. Now run the baseline with run_experiment.`,
+          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to .auto/log.jsonl. ${canContinue() ? "Now run the baseline with run_experiment." : "Continuation was superseded by a newer session action; no kickoff or hook steering was sent."}`,
         }],
         details: { state: cloneExperimentState(state) },
       };
@@ -2505,6 +2519,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       if (runtime.logInProgress) return logBusyResult();
       if (runtime.keepReconciliationRequired) return reconciliationResult();
+      const sessionKey = getSessionKey(ctx);
       runtime.logInProgress = true;
       try {
         // A keep is published only after its Git outcome and log append succeed.
@@ -2776,7 +2791,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
         // Consume per-run state at publication, before fallible hooks or UI work.
         // A failure in those follow-up actions does not undo the recorded result.
-        if (runtime.runGeneration === loggedGeneration) invalidateRunEvidence(runtime);
+        const logStillCurrent = getSessionKey(ctx) === sessionKey && runtime.runGeneration === loggedGeneration;
+        if (logStillCurrent) invalidateRunEvidence(runtime);
+        const currentHookContinuation = hookContinuationFor(ctx);
+        const canContinue = () => logStillCurrent && currentHookContinuation();
 
         try { broadcastDashboardUpdate(workDir); }
         catch (error) {
@@ -2815,12 +2833,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const label = payload.event === "after" ? "After" : "Before";
           let steer: string | null;
           try {
-            steer = await fireHook(payload);
+            steer = await fireHook(payload, canContinue);
           } catch (error) {
             text += `\n⚠️ ${label} hook failed: ${error instanceof Error ? error.message : String(error)}`;
             return;
           }
-          if (steer) {
+          if (steer && canContinue()) {
             try {
               await pi.sendUserMessage(steer, { deliverAs: "steer" });
             } catch (error) {
@@ -2837,12 +2855,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         });
 
         const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
-        if (limitReached) {
+        if (limitReached && canContinue()) {
           text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
           recordAutoresearchActivation(workDir, false);
           setAutoresearchMode(ctx, false);
           ctx.abort();
-        } else if (runtime.autoresearchMode) {
+        } else if (canContinue()) {
           await runPostLogHook({
             event: "before",
             cwd: workDir,
@@ -3530,13 +3548,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       );
 
       const state = runtime.state;
+      const canContinue = hookContinuationFor(ctx);
       const activationSteer = await fireHook({
         event: "before",
         cwd: workDir,
         next_run: state.results.length + 1,
         last_run: readLastRun(workDir),
         session: buildSessionSnapshot(state),
-      });
+      }, canContinue);
+      if (!canContinue()) return;
 
       // Prepend hook output only when prompt.md exists; otherwise the message
       // must stay `/skill:...`-prefixed for command expansion.

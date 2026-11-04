@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Ignore hook completions from superseded session generations. Turning autoresearch off,
+  clearing or switching sessions no longer lets a delayed hook enqueue an old kickoff,
+  steer the replacement session, or append its diagnostic into a replacement log.
+  Already recorded experiment results remain intact; this does not terminate running hooks.
+
 - Kept experiments are published only after a verified Git outcome and successful log append.
   Git errors no longer become successful kept results; uncertain commit or persistence outcomes
   pause the session for explicit reconciliation without retrying or rolling back user work.
