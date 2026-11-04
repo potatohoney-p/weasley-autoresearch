@@ -61,7 +61,7 @@ Write `groups.json`:
 
 Key rules:
 - **`last_commit` must be a full hash.** Expand from jsonl short hashes with `git rev-parse`.
-- **No two groups may share a file.** The script validates this and fails if violated.
+- **No two groups may share a file or overlapping ancestor/descendant paths.** Renames touch both the old and new paths. The script validates this before creating branches; merge overlapping groups.
 
 Then run:
 
@@ -70,6 +70,12 @@ bash <SKILL_DIR>/finalize.sh /tmp/groups.json
 ```
 
 The script creates one branch per group from the merge-base, verifies the union matches the original branch, and prints a summary with all branches, cleanup commands, and any ideas from `.auto/ideas.md` (legacy: `autoresearch.ideas.md`).
+
+Group restoration preserves additions, edits, deletions, renames and file/directory
+transitions. Paths are handled literally and remain NUL-delimited internally, including
+names with spaces, newlines or glob characters. Session artifacts stay excluded even
+when a file becomes a directory containing session files. This verifies Git tree
+content, not semantic independence; run each branch's relevant tests before review.
 
 On creation failure: rolls back (deletes branches, restores original branch, pops stash).
 On verification failure: exits non-zero but leaves branches intact for inspection.

@@ -118,25 +118,69 @@ collect_group_files() {
   git cat-file -t "$last_commit" 2>/dev/null | grep -q "commit" \
     || fail "Group $((group_index+1)) last_commit $last_commit not found. Use full hashes (git rev-parse <short>)."
 
-  # NUL-delimited (-z) via process substitution to handle spaces/globs in filenames.
+  # Keep paths NUL-delimited throughout. Disable rename detection so both the
+  # removed source and added destination belong to the group and overlap check.
   local changed_file
   : > "$DATA_DIR/$group_index.files"
   while IFS= read -r -d '' changed_file; do
     [ -n "$changed_file" ] || continue
-    is_session_file "$changed_file" || echo "$changed_file" >> "$DATA_DIR/$group_index.files"
-  done < <(git diff --name-only -z "$prev_commit" "$last_commit")
+    is_session_file "$changed_file" || printf '%s\0' "$changed_file" >> "$DATA_DIR/$group_index.files"
+  done < <(git diff --no-renames --name-only -z "$prev_commit" "$last_commit")
 }
 
 assert_no_overlapping_files() {
   local new_files_path="$1" seen_files_path="$2"
   [ -s "$new_files_path" ] || return 0
   [ -s "$seen_files_path" ] || return 0
-  local candidate
-  while IFS= read -r candidate; do
-    if grep -qxF "$candidate" "$seen_files_path"; then
-      fail "File '$candidate' appears in multiple groups. Merge the overlapping groups and retry."
-    fi
+  local candidate seen
+  while IFS= read -r -d '' candidate; do
+    while IFS= read -r -d '' seen; do
+      case "$candidate" in
+        "$seen"|"$seen"/*) fail "File '$candidate' appears in multiple groups (overlaps '$seen'). Merge the overlapping groups and retry.";;
+      esac
+      case "$seen" in
+        "$candidate"/*) fail "File '$candidate' appears in multiple groups (overlaps '$seen'). Merge the overlapping groups and retry.";;
+      esac
+    done < "$seen_files_path"
   done < "$new_files_path"
+}
+
+# Restore the selected paths exactly, including paths absent from the source.
+# Overlay checkout preserves deleted files. Literal pathspecs prevent names
+# containing globs from selecting peers; removals precede additions for type changes.
+restore_group_files() {
+  local source="$1" files_path="$2"
+  [ -s "$files_path" ] || return 0
+  # Partition exact leaf paths from the source tree. A removed file that became
+  # a directory must not select that directory recursively: it may contain
+  # excluded session artifacts. Remove old paths first, then restore only leaves.
+  local candidate present source_file restore_path="$files_path.restore" remove_path="$files_path.remove"
+  local source_paths="$files_path.source"
+  git ls-tree -r -z --name-only "$source" > "$source_paths" || return 1
+  : > "$restore_path"
+  : > "$remove_path"
+  while IFS= read -r -d '' candidate; do
+    present=false
+    while IFS= read -r -d '' source_file; do
+      if [ "$candidate" = "$source_file" ]; then present=true; break; fi
+    done < "$source_paths"
+    if [ "$present" = true ]; then
+      printf '%s\0' "$candidate" >> "$restore_path"
+    else
+      printf '%s\0' "$candidate" >> "$remove_path"
+    fi
+  done < "$files_path"
+  if [ -s "$remove_path" ]; then
+    while IFS= read -r -d '' candidate; do
+      git --literal-pathspecs rm --quiet --ignore-unmatch -- "$candidate" || return 1
+    done < "$remove_path"
+  fi
+  if [ -s "$restore_path" ]; then
+    while IFS= read -r -d '' candidate; do
+      git --literal-pathspecs checkout "$source" -- "$candidate" || return 1
+    done < "$restore_path"
+  fi
+
 }
 
 assert_branch_available() {
@@ -191,12 +235,17 @@ rollback_on_failure() {
   echo ""
   echo -e "${RED}FAILED — rolling back...${NC}"
   git reset --quiet HEAD -- . 2>/dev/null || true
+  # Leave the checked-out owned branch before deleting it. If generated changes
+  # prevent checkout, preserve them and the refs rather than forcing a reset.
+  if [ -n "${ORIG_BRANCH:-}" ] && ! git checkout "$ORIG_BRANCH" --quiet; then
+    warn "Could not restore '$ORIG_BRANCH'. Created branches and working files were preserved; inspect them manually."
+    if [ "$STASHED" = true ]; then warn "Original changes remain in the stash."; fi
+    cleanup_data
+    return
+  fi
   for branch in "${CREATED_BRANCHES[@]}"; do
     git branch -D "$branch" 2>/dev/null || true
   done
-  if [ -n "${ORIG_BRANCH:-}" ]; then
-    git checkout "$ORIG_BRANCH" --quiet 2>/dev/null || true
-  fi
   if [ "$STASHED" = true ]; then
     git stash pop --quiet 2>/dev/null \
       || echo -e "${YELLOW}⚠ Could not restore stashed changes. Run 'git stash list' to recover.${NC}"
@@ -240,17 +289,14 @@ create_group_branch() {
   # independently mergeable — reviewers can land them in any order.
   git checkout "$BASE" --quiet --detach 2>/dev/null || git checkout "$BASE" --quiet
   git checkout -b "$branch_name"
+  CREATED_BRANCHES+=("$branch_name")
 
-  while IFS= read -r changed_file; do
-    [ -n "$changed_file" ] || continue
-    git checkout "$last_commit" -- "$changed_file"
-  done < "$files_path"
+  restore_group_files "$last_commit" "$files_path"
   git commit -m "$title" -m "$body"
 
-  CREATED_BRANCHES+=("$branch_name")
   GROUP_BRANCH[$i]="$branch_name"
   echo "  Branch: $branch_name"
-  echo "  Files: $(tr '\n' ' ' < "$files_path")"
+  echo "  Files: $(tr '\0' ' ' < "$files_path")"
   echo ""
 }
 
@@ -280,6 +326,7 @@ create_branches() {
 
 verify_union_matches_original() {
   local verify_branch="autoresearch/${GOAL}/verify-tmp"
+  local restoration_failed=false
 
   git checkout "$BASE" --quiet --detach 2>/dev/null || git checkout "$BASE" --quiet
   git checkout -b "$verify_branch"
@@ -287,22 +334,29 @@ verify_union_matches_original() {
   for i in $(seq 0 $((GROUP_COUNT - 1))); do
     local last_commit
     last_commit=$(cat "$DATA_DIR/$i.last_commit")
-    while IFS= read -r changed_file; do
-      [ -n "$changed_file" ] || continue
-      git checkout "$last_commit" -- "$changed_file"
-    done < "$DATA_DIR/$i.files"
+    if ! restore_group_files "$last_commit" "$DATA_DIR/$i.files"; then
+      restoration_failed=true
+      break
+    fi
   done
   # --allow-empty: when all groups cover all files, the checkout leaves
   # nothing staged — the diff against FINAL_TREE is what matters, not this commit.
-  git commit --allow-empty -m "verify: union of all groups" --quiet
+  if [ "$restoration_failed" = false ]; then
+    git commit --allow-empty -m "verify: union of all groups" --quiet || restoration_failed=true
+  fi
 
   local non_session_diff=""
-  for changed_file in $(git diff --name-only HEAD "$FINAL_TREE" 2>/dev/null); do
+  while IFS= read -r -d '' changed_file; do
     is_session_file "$changed_file" || non_session_diff="$non_session_diff $changed_file"
-  done
+  done < <(git diff --no-renames --name-only -z HEAD "$FINAL_TREE")
 
   git checkout "$ORIG_BRANCH" --quiet 2>/dev/null || true
   git branch -D "$verify_branch" 2>/dev/null || true
+
+  if [ "$restoration_failed" = true ]; then
+    echo -e "${RED}✗ Could not reconstruct the union of groups.${NC}"
+    return 1
+  fi
 
   if [ -n "$non_session_diff" ]; then
     echo -e "${RED}✗ Union of groups differs from autoresearch branch!${NC}"
@@ -317,12 +371,12 @@ verify_union_matches_original() {
 verify_no_session_artifacts() {
   local clean=true
   for branch in "${CREATED_BRANCHES[@]}"; do
-    for changed_file in $(git diff-tree --no-commit-id --name-only -r "$(git rev-parse "$branch")" 2>/dev/null); do
+    while IFS= read -r -d '' changed_file; do
       if is_session_file "$changed_file"; then
         echo -e "${RED}✗ Session artifact '$changed_file' in branch $branch!${NC}"
         clean=false
       fi
-    done
+    done < <(git diff-tree --no-renames --no-commit-id --name-only -r -z "$(git rev-parse "$branch")")
   done
 
   if [ "$clean" = true ]; then
@@ -405,7 +459,7 @@ print_summary() {
     echo ""
     echo "  $group_number. $title"
     echo "     Branch: $branch"
-    echo "     Files: $(tr '\n' ' ' < "$DATA_DIR/$i.files")"
+    echo "     Files: $(tr '\0' ' ' < "$DATA_DIR/$i.files")"
     echo ""
     echo "$body" | sed 's/^/     /'
   done
