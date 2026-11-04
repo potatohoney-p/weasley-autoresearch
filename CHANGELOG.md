@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Bound correctness-check diagnostics to an 80-line, 4 KiB UTF-8-safe tail, with explicit
+  truncation metadata and notices. Long single-line output and execution errors no longer
+  expand the agent response or retained run evidence without a byte limit; check verdicts
+  and keep eligibility are unchanged.
 - Kept experiments are published only after a verified Git outcome and successful log append.
   Git errors no longer become successful kept results; uncertain commit or persistence outcomes
   pause the session for explicit reconciliation without retrying or rolling back user work.

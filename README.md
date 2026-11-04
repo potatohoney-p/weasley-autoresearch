@@ -367,6 +367,16 @@ npm test
 npm run lint
 ```
 
+Correctness-check diagnostics retain only their last 80 lines and at most 4 KiB of UTF-8 text,
+whichever limit is reached first. A final line longer than the byte limit retains a whole-character
+suffix. Truncation is disclosed in the tool response, result metadata and failed-check renderer;
+the retained tail is also used for later keep-refusal diagnostics. This applies to stdout/stderr
+and execution-error messages, including timed-out and successful checks. It does not change
+check verdicts or allow a failed check to authorize a keep. No full check-output artifact is
+created: arrange separate output capture in your check script when needed. The host still owns
+subprocess capture, so this bounds retained/displayed diagnostics after execution, not peak memory,
+total output generation or the lifetime of the check process.
+
 Optional `.auto/hooks/before.sh` and `.auto/hooks/after.sh` receive a JSON payload on stdin. Their
 stdout is delivered to the agent as bounded steering context. Each hook stream retains at most
 8 KiB of output bytes plus a truncation marker, including stderr from failed hooks. UTF-8
