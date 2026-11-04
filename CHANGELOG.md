@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added `weasley-compare`, a read-only comparison of complete repeated-benchmark reports.
+  Validates trial evidence and summaries, reports directional median changes, and warns when
+  recorded conditions differ without making significance or keep/discard decisions.
+
 ### Fixed
 
 - Kept experiments are published only after a verified Git outcome and successful log append.
