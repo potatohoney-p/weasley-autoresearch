@@ -395,10 +395,7 @@
         catch { return fail('One JSONL line is invalid JSON.'); }
       }
 
-      return normalizePayload(
-        objects.find(item => item.type === 'config') || null,
-        objects.filter(item => item.run != null)
-      );
+      return normalizeEntries(objects);
     }
 
     function parseJsonDocument(text) {
@@ -407,14 +404,12 @@
       catch { return fail('JSON parse failed.'); }
 
       if (Array.isArray(doc)) {
-        return normalizePayload(
-          doc.find(item => item.type === 'config') || null,
-          doc.filter(item => item.run != null)
-        );
+        return normalizeEntries(doc);
       }
 
       if (doc && typeof doc === 'object') {
-        return normalizePayload(extractConfig(doc), extractRuns(doc));
+        if (doc.type === 'config') return normalizeEntries([doc]);
+        return normalizeEntries(extractRuns(doc), extractConfig(doc));
       }
 
       return fail('Unsupported JSON shape.');
@@ -423,6 +418,7 @@
     function extractConfig(doc) {
       if (doc.config) return doc.config;
       if (doc.type === 'config') return doc;
+      if (!['name', 'metricName', 'metricUnit', 'bestDirection'].some(key => doc[key] != null)) return null;
       return {
         type: 'config',
         name: doc.name,
@@ -438,9 +434,37 @@
       return [];
     }
 
-    function normalizePayload(config, runs) {
+    // A new config starts a new experiment segment. Comparing measurements
+    // across those boundaries can mix different metrics, units and directions.
+    function normalizeEntries(entries, initialConfig = null) {
+      let config = { ...DEFAULT_CONFIG };
+      let hasConfig = false;
+      let runs = [];
+      function updateConfig(entry) {
+        for (const key of ['name', 'metricName', 'metricUnit']) {
+          if (typeof entry[key] === 'string') config[key] = entry[key];
+        }
+        config.bestDirection = entry.bestDirection === 'higher' ? 'higher' : 'lower';
+        hasConfig = true;
+      }
+      if (initialConfig && typeof initialConfig === 'object' && !Array.isArray(initialConfig)) {
+        updateConfig(initialConfig);
+      }
+      for (const entry of entries) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+        if (entry.type === 'config') {
+          updateConfig(entry);
+          runs = [];
+        } else if (entry.type === undefined && entry.run != null) {
+          runs.push(entry);
+        }
+      }
+      return normalizePayload(config, runs, hasConfig);
+    }
+
+    function normalizePayload(config, runs, allowEmpty = false) {
       const cfg = config || DEFAULT_CONFIG;
-      if (!Array.isArray(runs) || runs.length === 0) return fail('No runs found.');
+      if (!Array.isArray(runs) || (!allowEmpty && runs.length === 0)) return fail('No runs found.');
 
       return {
         ok: true,
@@ -497,6 +521,7 @@
     }
 
     function renderHeader() {
+      document.title = session.config.name;
       setText('title', session.config.name);
       setText('metric-header', session.config.metricName);
       setMetaMessage('metric: ' + session.config.metricName + ' · ' + session.direction + ' is better', false);
@@ -667,6 +692,7 @@
 
       const metricRange = computeMetricRange(session.runs);
       chartState.points = [];
+      chartState.geometry = null;
       if (!metricRange) return;
 
       const geo = buildChartGeometry(width, height, metricRange);
