@@ -447,11 +447,32 @@ interface AutoresearchConfig {
 
 /** Read the config file (.auto/config.json, legacy autoresearch.config.json) from the given directory (always ctx.cwd) */
 function readConfig(cwd: string): AutoresearchConfig {
-  const configPath = autoresearchConfigPath(cwd);
-  if (!fs.existsSync(configPath)) return {};
-
+  let configPath = sessionFileCandidates(cwd, "config").current;
   let parsed: unknown;
   try {
+    // existsSync treats unreadable paths and dangling links as absent. Neither
+    // may silently remove a working-directory redirect or iteration limit.
+    // Cache presence within this read so a selected file disappearing cannot
+    // become an absent optional config at the second probe.
+    const observed = new Map<string, boolean>();
+    const exists = (file: string): boolean => {
+      if (observed.has(file)) return observed.get(file)!;
+      try {
+        fs.lstatSync(file);
+        observed.set(file, true);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        observed.set(file, false);
+        return false;
+      }
+    };
+    const currentDir = path.join(cwd, AUTO_DIR);
+    if (exists(currentDir) && !fs.statSync(currentDir).isDirectory()) {
+      throw new Error(`${currentDir} is not a directory.`);
+    }
+    configPath = sessionFilePath(cwd, "config", exists);
+    if (!exists(configPath)) return {};
     parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
   } catch (error) {
     throw new Error(
@@ -652,7 +673,6 @@ const autoresearchMdPath     = (dir: string) => sessionFilePath(dir, "prompt");
 const autoresearchIdeasPath  = (dir: string) => sessionFilePath(dir, "ideas");
 const autoresearchChecksPath = (dir: string) => sessionFilePath(dir, "checks");
 const autoresearchScriptPath = (dir: string) => sessionFilePath(dir, "measure");
-const autoresearchConfigPath = (dir: string) => sessionFilePath(dir, "config");
 
 function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
   const index = results.findIndex((result) => result.segment === segment);

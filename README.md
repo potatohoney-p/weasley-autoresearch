@@ -203,6 +203,15 @@ Discard/crash rollback behavior is unchanged.
 Malformed JSON, wrong types, invalid values, and unknown fields disable activation with an error.
 They are never treated as an empty/default config.
 
+Only a genuinely absent configuration uses defaults. Configuration lookup also rejects
+unreadable paths, dangling current or legacy config links, and a broken or non-directory
+`.auto` layout instead of silently losing a working-directory redirect or iteration limit.
+An observed config that disappears before reading is an error. Valid linked config files
+and linked `.auto` directories remain supported, subject to the existing clean-worktree
+guard. Repair the reported path, then explicitly activate or retry the requested operation.
+No configuration is repaired or replaced automatically. These are per-read checks, not an
+atomic snapshot or a lock against concurrent configuration changes.
+
 ## Structured metric output
 
 Emit one `METRIC name=value` record per line. Names accept ASCII word characters,
