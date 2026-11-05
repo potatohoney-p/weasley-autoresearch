@@ -3274,7 +3274,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     let reject!: (error: Error) => void;
     const promise = new Promise<number>((res, rej) => { resolve = res; reject = rej; });
     const server = createServer((req, res) => {
-      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      let url: URL;
+      try {
+        url = new URL(req.url ?? "/", "http://127.0.0.1");
+      } catch {
+        // Node's HTTP parser can accept targets that URL rejects. Contain that
+        // request error here instead of letting it terminate the experiment host.
+        res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Bad Request");
+        return;
+      }
 
       if (url.pathname === "/events") {
         registerSseClient(res);
